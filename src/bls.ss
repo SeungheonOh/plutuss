@@ -1,0 +1,186 @@
+;;; bls.ss — BLS12-381 builtins via blst FFI.
+;;; Point reps (raw C struct bytes): g1 = bv144, g2 = bv288, ml(fp12) = bv576.
+
+(define libblst-path "blst/libblst.dylib")
+(load-shared-object libblst-path)
+
+(define P1-SIZE 144) (define P1A-SIZE 96)
+(define P2-SIZE 288) (define P2A-SIZE 192)
+(define FP12-SIZE 576)
+
+;; FFI
+(define c-p1-uncompress (foreign-procedure "blst_p1_uncompress" (u8* u8*) int))
+(define c-p1-from-affine (foreign-procedure "blst_p1_from_affine" (u8* u8*) void))
+(define c-p1-in-g1 (foreign-procedure "blst_p1_in_g1" (u8*) int))
+(define c-p1-compress (foreign-procedure "blst_p1_compress" (u8* u8*) void))
+(define c-p1-to-affine (foreign-procedure "blst_p1_to_affine" (u8* u8*) void))
+(define c-p1-is-equal (foreign-procedure "blst_p1_is_equal" (u8* u8*) int))
+(define c-p1-add (foreign-procedure "blst_p1_add_or_double" (u8* u8* u8*) void))
+(define c-p1-cneg (foreign-procedure "blst_p1_cneg" (u8* int) void))
+(define c-p1-mult (foreign-procedure "blst_p1_mult" (u8* u8* u8* size_t) void))
+(define c-hash-to-g1 (foreign-procedure "blst_hash_to_g1" (u8* u8* size_t u8* size_t void* size_t) void))
+
+(define c-p2-uncompress (foreign-procedure "blst_p2_uncompress" (u8* u8*) int))
+(define c-p2-from-affine (foreign-procedure "blst_p2_from_affine" (u8* u8*) void))
+(define c-p2-in-g2 (foreign-procedure "blst_p2_in_g2" (u8*) int))
+(define c-p2-compress (foreign-procedure "blst_p2_compress" (u8* u8*) void))
+(define c-p2-to-affine (foreign-procedure "blst_p2_to_affine" (u8* u8*) void))
+(define c-p2-is-equal (foreign-procedure "blst_p2_is_equal" (u8* u8*) int))
+(define c-p2-add (foreign-procedure "blst_p2_add_or_double" (u8* u8* u8*) void))
+(define c-p2-cneg (foreign-procedure "blst_p2_cneg" (u8* int) void))
+(define c-p2-mult (foreign-procedure "blst_p2_mult" (u8* u8* u8* size_t) void))
+(define c-hash-to-g2 (foreign-procedure "blst_hash_to_g2" (u8* u8* size_t u8* size_t void* size_t) void))
+
+(define c-miller-loop (foreign-procedure "blst_miller_loop" (u8* u8* u8*) void))
+(define c-fp12-mul (foreign-procedure "blst_fp12_mul" (u8* u8* u8*) void))
+(define c-fp12-finalverify (foreign-procedure "blst_fp12_finalverify" (u8* u8*) int))
+
+;; ---- uncompress (returns 144/288-byte point bv or #f on failure) ----
+(define (bls-g1-uncompress-core bv48)
+  (and (fx=? (bytevector-length bv48) 48)
+       (let ((aff (make-bytevector P1A-SIZE 0)))
+         (and (fx=? 0 (c-p1-uncompress aff bv48))
+              (let ((p (make-bytevector P1-SIZE 0)))
+                (c-p1-from-affine p aff)
+                (and (not (fx=? 0 (c-p1-in-g1 p))) p))))))
+(define (bls-g2-uncompress-core bv96)
+  (and (fx=? (bytevector-length bv96) 96)
+       (let ((aff (make-bytevector P2A-SIZE 0)))
+         (and (fx=? 0 (c-p2-uncompress aff bv96))
+              (let ((p (make-bytevector P2-SIZE 0)))
+                (c-p2-from-affine p aff)
+                (and (not (fx=? 0 (c-p2-in-g2 p))) p))))))
+
+;; parser-facing: invalid -> parse error
+(define (bls-g1-uncompress* bv48)
+  (or (bls-g1-uncompress-core bv48) (parse-error "invalid G1 point")))
+(define (bls-g2-uncompress* bv96)
+  (or (bls-g2-uncompress-core bv96) (parse-error "invalid G2 point")))
+
+;; output/comparison-facing
+(define (bls-g1-compress p)
+  (let ((out (make-bytevector 48 0))) (c-p1-compress out p) out))
+(define (bls-g2-compress p)
+  (let ((out (make-bytevector 96 0))) (c-p2-compress out p) out))
+(define (bls-ml-eq? a b) (bytevector=? a b))
+
+;; ---- point ops ----
+(define (bls-g1-add a b) (let ((o (make-bytevector P1-SIZE 0))) (c-p1-add o a b) o))
+(define (bls-g2-add a b) (let ((o (make-bytevector P2-SIZE 0))) (c-p2-add o a b) o))
+(define (bls-g1-neg p) (let ((o (bytevector-copy p))) (c-p1-cneg o 1) o))
+(define (bls-g2-neg p) (let ((o (bytevector-copy p))) (c-p2-cneg o 1) o))
+(define (bls-g1-equal a b) (not (fx=? 0 (c-p1-is-equal a b))))
+(define (bls-g2-equal a b) (not (fx=? 0 (c-p2-is-equal a b))))
+
+(define (int->le-bytes a nbytes)        ; a>=0
+  (let ((bv (make-bytevector nbytes 0)))
+    (let loop ((i 0) (a a))
+      (if (or (fx=? i nbytes) (zero? a)) bv
+          (begin (bytevector-u8-set! bv i (logand a #xFF)) (loop (fx+ i 1) (ash a -8)))))))
+
+(define (bls-scalar-mul mult-fn neg-fn psize point scalar)
+  (cond
+   ((zero? scalar)
+    (let ((o (make-bytevector psize 0))) (mult-fn o point (make-bytevector 1 0) 1) o))
+   (else
+    (let* ((neg (< scalar 0)) (a (abs scalar))
+           (nbits (integer-length a))
+           (nbytes (fxmax 1 (fxquotient (fx+ nbits 7) 8)))
+           (sbytes (int->le-bytes a nbytes))
+           (p (if neg (if (fx=? psize P1-SIZE) (bls-g1-neg point) (bls-g2-neg point)) point))
+           (o (make-bytevector psize 0)))
+      (mult-fn o p sbytes nbits) o))))
+;; multiScalarMul/scalarMul scalar bound: 64 words = 4096 bits.
+(define msm-scalar-ub (- (expt 2 4095) 1))
+(define msm-scalar-lb (- (expt 2 4095)))
+(define (msm-scalar-out-of-bounds? s) (not (and (<= msm-scalar-lb s) (<= s msm-scalar-ub))))
+
+(define (bls-g1-scalar-mul s p)
+  (when (msm-scalar-out-of-bounds? s) (eval-failure "G1 scalar out of bounds"))
+  (bls-scalar-mul c-p1-mult #f P1-SIZE p s))
+(define (bls-g2-scalar-mul s p)
+  (when (msm-scalar-out-of-bounds? s) (eval-failure "G2 scalar out of bounds"))
+  (bls-scalar-mul c-p2-mult #f P2-SIZE p s))
+
+(define (bls-g1-hash msg dst)
+  (let ((o (make-bytevector P1-SIZE 0)))
+    (c-hash-to-g1 o (ffi-ptr msg) (bytevector-length msg) (ffi-ptr dst) (bytevector-length dst) 0 0) o))
+(define (bls-g2-hash msg dst)
+  (let ((o (make-bytevector P2-SIZE 0)))
+    (c-hash-to-g2 o (ffi-ptr msg) (bytevector-length msg) (ffi-ptr dst) (bytevector-length dst) 0 0) o))
+
+(define (bls-miller-loop g1 g2)
+  (let ((p1a (make-bytevector P1A-SIZE 0)) (p2a (make-bytevector P2A-SIZE 0))
+        (o (make-bytevector FP12-SIZE 0)))
+    (c-p1-to-affine p1a g1) (c-p2-to-affine p2a g2)
+    (c-miller-loop o p2a p1a) o))
+(define (bls-mul-ml a b) (let ((o (make-bytevector FP12-SIZE 0))) (c-fp12-mul o a b) o))
+(define (bls-final-verify a b) (not (fx=? 0 (c-fp12-finalverify a b))))
+
+(define g1-zero-compressed
+  (let ((bv (make-bytevector 48 0))) (bytevector-u8-set! bv 0 #xc0) bv))
+(define g2-zero-compressed
+  (let ((bv (make-bytevector 96 0))) (bytevector-u8-set! bv 0 #xc0) bv))
+
+;; ---- builtin dispatch ----
+(define (bls-builtins fn args)
+  (define (a i) (list-ref args i))
+  (case fn
+    ((bls12_381_g1_add) (vg1 (bls-g1-add (as-g1 (a 0)) (as-g1 (a 1)))))
+    ((bls12_381_g1_neg) (vg1 (bls-g1-neg (as-g1 (a 0)))))
+    ((bls12_381_g1_scalar_mul) (vg1 (bls-g1-scalar-mul (as-int (a 0)) (as-g1 (a 1)))))
+    ((bls12_381_g1_equal) (vbool (bls-g1-equal (as-g1 (a 0)) (as-g1 (a 1)))))
+    ((bls12_381_g1_compress) (vbytes (bls-g1-compress (as-g1 (a 0)))))
+    ((bls12_381_g1_uncompress)
+     (let ((bv (as-bytes (a 0))))
+       (unless (fx=? (bytevector-length bv) 48) (eval-failure "g1 uncompress len"))
+       (vg1 (or (bls-g1-uncompress-core bv) (eval-failure "g1 uncompress")))))
+    ((bls12_381_g1_hash_to_group)
+     (let ((msg (as-bytes (a 0))) (dst (as-bytes (a 1))))
+       (when (fx>? (bytevector-length dst) 255) (eval-failure "g1 dst too long"))
+       (vg1 (bls-g1-hash msg dst))))
+    ((bls12_381_g2_add) (vg2 (bls-g2-add (as-g2 (a 0)) (as-g2 (a 1)))))
+    ((bls12_381_g2_neg) (vg2 (bls-g2-neg (as-g2 (a 0)))))
+    ((bls12_381_g2_scalar_mul) (vg2 (bls-g2-scalar-mul (as-int (a 0)) (as-g2 (a 1)))))
+    ((bls12_381_g2_equal) (vbool (bls-g2-equal (as-g2 (a 0)) (as-g2 (a 1)))))
+    ((bls12_381_g2_compress) (vbytes (bls-g2-compress (as-g2 (a 0)))))
+    ((bls12_381_g2_uncompress)
+     (let ((bv (as-bytes (a 0))))
+       (unless (fx=? (bytevector-length bv) 96) (eval-failure "g2 uncompress len"))
+       (vg2 (or (bls-g2-uncompress-core bv) (eval-failure "g2 uncompress")))))
+    ((bls12_381_g2_hash_to_group)
+     (let ((msg (as-bytes (a 0))) (dst (as-bytes (a 1))))
+       (when (fx>? (bytevector-length dst) 255) (eval-failure "g2 dst too long"))
+       (vg2 (bls-g2-hash msg dst))))
+    ((bls12_381_g1_multi_scalar_mul) (bls-msm (a 0) (a 1) #t))
+    ((bls12_381_g2_multi_scalar_mul) (bls-msm (a 0) (a 1) #f))
+    ((bls12_381_miller_loop) (vml (bls-miller-loop (as-g1 (a 0)) (as-g2 (a 1)))))
+    ((bls12_381_mul_ml_result) (vml (bls-mul-ml (as-ml (a 0)) (as-ml (a 1)))))
+    ((bls12_381_final_verify) (vbool (bls-final-verify (as-ml (a 0)) (as-ml (a 1)))))
+    (else #f)))
+
+(define (vg1 p) (vector 'vcon (list 'g1 p)))
+(define (vg2 p) (vector 'vcon (list 'g2 p)))
+(define (vml f) (vector 'vcon (list 'ml f)))
+
+(define (bls-msm sc-arg pt-arg g1?)
+  (let* ((scalars (lc-items (as-list-const sc-arg)))
+         (points (lc-items (as-list-const pt-arg)))
+         (n (fxmin (length scalars) (length points))))
+    (if (fx=? n 0)
+        (if g1? (vg1 (bls-g1-uncompress-core g1-zero-compressed))
+            (vg2 (bls-g2-uncompress-core g2-zero-compressed)))
+        (let loop ((i 0) (ss scalars) (ps points) (acc #f))
+          (if (fx=? i n)
+              (if g1? (vg1 acc) (vg2 acc))
+              (let* ((s (let ((c (car ss))) (if (eq? (car c) 'int) (cadr c) (eval-failure "msm scalar"))))
+                     (p (let ((c (car ps))) (if (eq? (car c) (if g1? 'g1 'g2)) (cadr c) (eval-failure "msm point"))))
+                     (term (if g1? (bls-g1-scalar-mul s p) (bls-g2-scalar-mul s p)))
+                     (acc2 (if acc (if g1? (bls-g1-add acc term) (bls-g2-add acc term)) term)))
+                (loop (fx+ i 1) (cdr ss) (cdr ps) acc2)))))))
+
+(define apply-builtin-extra-prev5 apply-builtin-extra)
+(set! apply-builtin-extra
+  (lambda (fn args)
+    (or (bls-builtins fn args)
+        (apply-builtin-extra-prev5 fn args))))
