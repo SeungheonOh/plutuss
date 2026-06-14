@@ -1,0 +1,20 @@
+;;; (plutuss) — convenience aggregate: re-exports the public API so callers can
+;;; just (import (plutuss)) instead of importing each sub-library.
+(library (plutuss)
+  (export ;; front-end / machine
+          parse-program name->debruijn machine-run
+          ;; output
+          pretty-program pretty-term term-alpha-eq? const-eq? bytevector->hex
+          ;; flat / cbor codecs
+          flat-encode-program flat-decode-program cbor-encode cbor-decode
+          ;; syntax DSL (+ auxiliary keywords)
+          uplc uplc-program uplc-eval uplc-run hex ->bytes
+          lam con builtin constr I B List Map Constr
+          integer bytestring bool unit data pair
+          ;; budget + errors + misc
+          get-cpu-spent get-mem-spent get-mach-logs i64-max i64-min
+          parse-err? eval-fail? parse-err-msg eval-fail-msg
+          parse-error eval-failure builtin-lookup hex->bytevector)
+  (import (plutuss base) (plutuss value) (plutuss cbor) (plutuss cost)
+          (plutuss state) (plutuss builtins) (plutuss machine)
+          (plutuss frontend) (plutuss output) (plutuss flat) (plutuss dsl)))

@@ -1,5 +1,6 @@
 (import (chezscheme))
-(load "src/load.ss")
+(library-directories (list "src"))
+(import (plutuss))
 
 (define base "plutus/plutus-conformance/test-cases/uplc/evaluation")
 (define (read-file path) (call-with-input-file path (lambda (p) (get-string-all p))))
@@ -38,7 +39,7 @@
        (let* ((prog (parse-program src))
               (term (name->debruijn (vector-ref prog 2)))
               (res (machine-run term)))
-         (k (list 'ok res (min cpu-spent i64-max) (min mem-spent i64-max)))))))))
+         (k (list 'ok res (min (get-cpu-spent) i64-max) (min (get-mem-spent) i64-max)))))))))
 
 (define (parse-budget-file path)
   (and (file-exists? path)

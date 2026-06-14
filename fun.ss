@@ -1,5 +1,6 @@
 (import (chezscheme))
-(load "src/load.ss")
+(library-directories (list "src"))
+(import (plutuss))
 
 (define (set-3bytevector-at! bv pos n)
   (bytevector-u8-set! bv pos (bitwise-and (bitwise-arithmetic-shift-right n 16) #xff))
@@ -44,7 +45,7 @@
                   0
                   [ [ (builtin multiplyInteger) i-0 ] (con integer 3) ]
                   (con integer 3)
-                  ($ fibo-packed)
+                  ,fibo-packed
                   )
                (builtin sliceByteString)
                )
@@ -57,5 +58,5 @@
     )
    ))
 
-(uplc-eval (uplc [($ fibo) (con integer 10)] ))
-(uplc-eval (uplc [($ fibo) (con integer 15)] ))
+(uplc-eval (uplc [,fibo (con integer 10)] ))
+(uplc-eval (uplc [,fibo (con integer 15)] ))

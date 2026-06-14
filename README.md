@@ -1,4 +1,4 @@
-# pluscheme
+# plutuss
 
 A [UPLC](https://github.com/IntersectMBO/plutus) (Untyped Plutus Core) CEK machine
 implemented in **Chez Scheme**, structurally equivalent to the Zig reference
@@ -23,8 +23,9 @@ TOTAL=999  result-pass=999  full-pass(result+budget)=999
 
 The cost model is the Cardano **cost-model variant E** (`DefaultFunSemanticsVariantE`),
 which is what `defaultCostModelParamsForTesting` selects and what the conformance
-budget golden files were generated with. The full builtin cost table in
-`src/cost-table.ss` is auto-generated verbatim from `builtinCostModelE.json`.
+budget golden files were generated with. The full builtin cost table
+(`src/plutuss/cost-table.ss`, used by `(plutuss cost)`) is auto-generated
+verbatim from `builtinCostModelE.json`.
 
 ## Requirements
 
@@ -45,13 +46,13 @@ juggling).
 ./build-blst.sh                          # build blst/libblst.dylib once
 
 # Evaluate a program (prints the result, or `evaluation failure` / `parse error`)
-chez --script pluscheme.ss program.uplc
-chez --script pluscheme.ss -b program.uplc   # also print consumed budget
-chez --script pluscheme.ss -p program.uplc   # pretty-print only, no eval
+chez --script plutuss.ss program.uplc
+chez --script plutuss.ss -b program.uplc   # also print consumed budget
+chez --script plutuss.ss -p program.uplc   # pretty-print only, no eval
 
 # Flat (binary on-chain) codec
-chez --script pluscheme.ss -f program.uplc   # encode to flat, print as hex
-chez --script pluscheme.ss -u script.flat    # decode a .flat file to textual UPLC
+chez --script plutuss.ss -f program.uplc   # encode to flat, print as hex
+chez --script plutuss.ss -u script.flat    # decode a .flat file to textual UPLC
 
 # Run the full conformance suite (expects the plutus repo cloned at ./plutus)
 git clone --depth 1 https://github.com/intersectMBO/plutus.git
@@ -61,7 +62,7 @@ chez --script tools/conf.ss /builtin/semantics/addInteger   # a subset
 
 ## Syntax DSL (build ASTs from Scheme, no string parsing)
 
-`src/dsl.ss` is a macro front-end: where `frontend.ss` tokenizes and parses a
+`(plutuss dsl)` is a macro front-end: where `(plutuss frontend)` tokenizes and parses a
 *string*, the `uplc` macro builds the very same named AST directly from
 s-expression syntax at macro-expansion time. UPLC's textual grammar is already
 list-shaped, so it maps almost 1:1 (and Chez reads `[f a]` as `(f a)`, so the
@@ -82,13 +83,19 @@ application brackets work verbatim):
 ```
 
 Because it's a macro, constant values and `constr` tags can be arbitrary Scheme
-expressions, and `($ e)` splices a Scheme-built sub-term:
+expressions; `,e` splices a Scheme-built sub-term, and `,@e` splices a Scheme
+list of terms into the list-shaped positions (`case` branches, `constr` fields,
+application arguments — and `List`/`Map`/`Constr` data elements):
 
 ```scheme
 (uplc (con integer (* 6 7)))                       ; 42
 (uplc (con data (Constr 0 (I 1) (B (hex "ab")))))  ; data literals
 (uplc (con (pair integer bool) (42 #t)))           ; pair / list constants
-(let ((t (uplc (con integer 42)))) (uplc [ (lam x x) ($ t) ]))
+(let ((t (uplc (con integer 42)))) (uplc [ (lam x x) ,t ]))
+(let ((branches (list (uplc (lam x x)))))
+  (uplc (case (constr 0 (con integer 7)) ,@branches)))
+(uplc (con data (Constr 0 ,@(map (lambda (n) (list 'I n)) '(1 2 3)))))
+(uplc (lam ,(gensym->unique-string (gensym)) (con unit ())))  ; computed binder name
 ```
 
 Entry points: `(uplc term)`, `(uplc-program (maj min pat) term)`, `(uplc-eval term)`,
@@ -97,7 +104,7 @@ string parser's output, so it feeds the same `name->debruijn` + CEK pipeline.
 
 ## Flat (binary) codec
 
-`src/flat.ss` implements the bit-level **flat** serialization defined by the
+`(plutuss flat)` implements the bit-level **flat** serialization defined by the
 Plutus Core specification — the on-chain encoding for Plutus scripts. It encodes
 de-Bruijn programs MSB-first: 7-bit-chunked naturals, zigzag-encoded integers,
 byte-aligned 255-byte-chunked byte arrays, 4-bit term tags, 7-bit builtin tags,
@@ -136,31 +143,42 @@ The runner `tools/conf.ss` replicates the official `compareAlphaEq`: it parses
 both the produced and expected programs to de-Bruijn terms and compares
 structurally (ignoring binder names), and compares the budget exactly.
 
-## Source map
+## Module structure
+
+The implementation is a set of R6RS libraries under `src/plutuss/`, with an
+aggregate `(plutuss)` (`src/plutuss.ss`) that re-exports the public API.
+There is no `(load …)`: callers set the library directory and import:
+
+```scheme
+(import (chezscheme))
+(library-directories (list "src"))
+(import (plutuss))        ; or import individual sub-libraries
+```
 
 ```mermaid
 flowchart TB
-  frontend["frontend.ss<br/>lexer · parser · deBruijn"]
-  dsl["dsl.ss<br/>macro front-end (build AST from syntax)"]
-  value["value.ss<br/>multi-asset Value ops"]
-  cost["cost.ss + cost-table.ss<br/>ExMem · costing algebra · variant-E table"]
-  machine["machine.ss<br/>CEK loop · contexts · discharge"]
-  builtins["builtins.ss<br/>dispatch · arithmetic · bytestring · string · list"]
-  data["data.ss<br/>Data builtins · CBOR (serialiseData)"]
-  bitwise["bitwise.ss<br/>bitwise + integer/bytestring conversion"]
-  vbi["value-builtins.ss<br/>insertCoin · unionValue · scaleValue · …"]
-  crypto["crypto.ss<br/>sha2/blake2b/ed25519/secp256k1 (FFI) · keccak/sha3/ripemd (pure)"]
-  bls["bls.ss<br/>BLS12-381 via blst FFI"]
-  output["output.ss<br/>pretty printer · alpha-eq comparison"]
-  flat["flat.ss<br/>flat binary codec · CBOR decode"]
+  base["(plutuss base)<br/>errors · names · hex · byte utils · i64/sat · utf8"]
+  value["(plutuss value)<br/>multi-asset Value ops"]
+  cbor["(plutuss cbor)<br/>PlutusData CBOR encode/decode"]
+  cost["(plutuss cost)<br/>ExMem · costing algebra · variant-E table · arity"]
+  state["(plutuss state)<br/>execution budget + environment"]
+  builtins["(plutuss builtins)<br/>all builtin groups + eval-builtin + FFI (crypto, blst)"]
+  machine["(plutuss machine)<br/>CEK loop · contexts · discharge"]
+  frontend["(plutuss frontend)<br/>lexer · parser · name→deBruijn"]
+  output["(plutuss output)<br/>pretty printer · alpha-eq comparison"]
+  flat["(plutuss flat)<br/>flat binary codec"]
+  dsl["(plutuss dsl)<br/>uplc macro front-end"]
 
-  frontend --> machine
-  dsl --> machine
-  cost --> machine
-  machine --> builtins
-  builtins --> data --> bitwise --> vbi --> crypto --> bls --> output --> flat
-  value --> vbi
+  base --> value --> cost --> state --> builtins --> machine --> dsl
+  base --> cbor --> builtins
+  builtins --> frontend --> dsl
+  builtins --> output --> dsl
+  cbor --> flat
 ```
+
+The builtin groups (arithmetic/bytestring/string/list, data, bitwise, value,
+crypto, BLS) live inside `(plutuss builtins)` so they share helpers without a
+mutable global dispatcher; `eval-builtin` composes them with explicit `or`.
 
 ## Notes on tricky conformance details
 

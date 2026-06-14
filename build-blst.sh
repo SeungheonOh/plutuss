@@ -1,6 +1,6 @@
 #!/bin/bash
 # Build the blst shared library used by the BLS12-381 builtins.
-# Produces blst/libblst.dylib (macOS) which src/bls.ss dlopens.
+# Produces blst/libblst.dylib (macOS) which the (plutuss builtins) library dlopens.
 set -e
 if [ ! -d blst ]; then
   git clone --depth 1 https://github.com/supranational/blst.git

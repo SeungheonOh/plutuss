@@ -1,7 +1,7 @@
-;;; pluscheme.ss — UPLC CEK evaluator CLI.
+;;; plutuss.ss — UPLC CEK evaluator CLI.
 ;;;
 ;;; Usage:
-;;;   chez --script pluscheme.ss [options] <file.uplc>
+;;;   chez --script plutuss.ss [options] <file.uplc>
 ;;; Options:
 ;;;   -p, --pretty   parse and pretty-print only (no evaluation)
 ;;;   -b, --budget   print consumed execution budget after the result
@@ -9,10 +9,11 @@
 ;;;
 ;;; Output: the evaluated program, or `evaluation failure` / `parse error`.
 (import (chezscheme))
-(load "src/load.ss")
+(library-directories (list "src"))
+(import (plutuss))
 
 (define (usage)
-  (display "Usage: chez --script pluscheme.ss [options] <file>\n")
+  (display "Usage: chez --script plutuss.ss [options] <file>\n")
   (display "  -p/--pretty  pretty-print parsed program (no eval)\n")
   (display "  -b/--budget  print consumed budget after result\n")
   (display "  -f/--flat    emit the flat (binary) encoding as hex\n")
@@ -76,6 +77,6 @@
                   (display (pretty-program version result)) (newline)
                   (when budget
                     (printf "({cpu: ~a\n| mem: ~a})\n"
-                            (min cpu-spent i64-max) (min mem-spent i64-max))))))))))))
+                            (min (get-cpu-spent) i64-max) (min (get-mem-spent) i64-max))))))))))))
 
 (main (cdr (command-line)))
