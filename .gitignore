@@ -1,0 +1,18 @@
+# Compiled Chez Scheme object files
+*.so
+*.wpo
+
+# Vendored external clones (build/reference deps, re-fetched via scripts)
+/blst/
+/plutus/
+/plutuz/
+
+# Native build artifacts
+*.a
+*.dylib
+*.o
+*.dll
+*.exe
+
+# macOS
+.DS_Store
