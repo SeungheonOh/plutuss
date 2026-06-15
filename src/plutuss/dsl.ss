@@ -39,7 +39,7 @@
 ;;;   (hex "deadbeef")             -> bytevector, for (con bytestring ...)
 
 (library (plutuss dsl)
-  (export uplc uplc-program uplc-eval uplc-run hex ->bytes
+  (export uplc uplc-program uplc-pretty uplc-eval uplc-run hex ->bytes
           ;; auxiliary keywords (so syntax-rules literals match at the use site;
           ;; delay/force/case/error/list/string and unquote/unquote-splicing
           ;; match via (chezscheme); pair is bound nowhere else, so it must be
@@ -192,6 +192,12 @@
 ;; FUNCTIONS, not macros: pass a term value, e.g. (uplc-eval (uplc (lam x x)))
 ;; or, when the term is already bound, (uplc-eval my-term).
 (define (uplc-eval ast) (machine-run (name->debruijn ast)))
+
+(define (string->sexp s)
+  (let ([p (open-input-string s)])
+    (read p)))
+
+(define (uplc-pretty ast) (pretty-print (string->sexp (pretty-term (name->debruijn ast)))))
 
 ;; Evaluate and pretty-print the result as a 1.1.0 program string.
 (define (uplc-run ast) (pretty-program (vector 1 1 0) (uplc-eval ast))))
