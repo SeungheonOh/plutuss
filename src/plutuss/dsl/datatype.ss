@@ -19,11 +19,13 @@ return uplc node that handles according to the handlers.
 |#
 
 (library (plutuss dsl datatype)
-  (export)
+  (export define-plutus-type define-plutus-type-Data)
   (import (chezscheme) (plutuss base) (plutuss dsl))
-  )
 
-(define (indexp f lst)
+;; Expand-time helpers: these run inside the macro transformers below (and
+;; inside the `match-<name>` transformers they generate), so they must live at
+;; phase 1 — hence `meta`.
+(meta define (indexp f lst)
   (let loop ((rest-lst lst) (index 0))
     (cond
      ((null? rest-lst) #f)
@@ -43,13 +45,13 @@ return uplc node that handles according to the handlers.
           (loop (+ n 1)
                 (quotient m 2))))))
 
-(define (prefix-id prefix id)
+(meta define (prefix-id prefix id)
   (datum->syntax id
                  (string->symbol
                   (string-append prefix
                                  (symbol->string (syntax->datum id))))))
 
-(define (mkMatchHandler ctors val handler)
+(meta define (mkMatchHandler ctors val handler)
   (syntax-case handler ()
     [(ctor ((binder fieldname) ...) body)
      (let* ([ctor-idx (indexp (lambda (x) (eq? (syntax->datum (car x)) (syntax->datum #'ctor))) ctors)]
@@ -163,7 +165,7 @@ return uplc node that handles according to the handlers.
             (define ctors '(#,@(map (lambda (ctor) #`(#,@ctor)) ctors)))
             (syntax-case stx ()
               [(_ val handlers (... ...))
-               (with-syntax ([(constr-d) (generate-temporaries #'(constr-d))])
+               (with-syntax ([(constr-d idx) (generate-temporaries #'(constr-d idx))])
                  (let* ([expanded-handlers
                          (sort
                           (lambda (x y) (< (car x) (car y)))
@@ -174,7 +176,7 @@ return uplc node that handles according to the handlers.
                          (let loop ([is (iota (length ctors))] [hs expanded-handlers] [acc '()])
                            (cond
                             [(null? is) (reverse acc)]
-                            [(= (car is) (caar hs)) (loop (cdr is) (cdr hs) (cons (cadar hs) acc))]
+                            [(and (pair? hs) (= (car is) (caar hs))) (loop (cdr is) (cdr hs) (cons (cadar hs) acc))]
                             [else (loop (cdr is) hs (cons #'(error) acc))]
                             ))])
                    #`(uplc (case [(builtin unConstrData) val]
@@ -199,21 +201,8 @@ return uplc node that handles according to the handlers.
     [(_ SOP (ctor field ...) ...) #'(40)]
     ))
 
-(define-plutus-type SOP (yo foo bar))
+)  ; library (plutuss dsl datatype)
 
-(define-plutus-type-Data Option
-  (None)
-  (Some foo bar))
-
-(uplc-eval (mkSome (con data (I 1)) (con data (I 3))))
-;; #(con (data Constr 1 ((I 1) (I 3))))
-
-(uplc-eval
- (matchOption
-  ,(mkSome (con data (I 1)) (con data (I 3)))
-  (Some ([x foo] [y bar])
-        [(builtin addInteger) [(builtin unIData) ,x] [(builtin unIData) ,y]])
-  (None () (con integer 42))
-  )
- )
-;; #(con (integer . 4))
+;; Worked demos live in the examples; see:
+;;   src/plutuss/dsl/example-option.ss   — the original Option smoke test
+;;   src/plutuss/dsl/example-interval.ss — PlutusLedgerApi.V1.Interval port
