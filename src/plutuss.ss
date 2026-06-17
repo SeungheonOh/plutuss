@@ -20,6 +20,7 @@
           smt-sort-list smt-sort-pair
           smt-var smt-int smt-bool smt-neg smt-not smt-bin smt-uop smt-ite
           smt-mkpair smt-fst smt-snd smt-nil smt-cons smt-head smt-tail smt-null
+          smt-verify-sig smt-bls-bin smt-bls-operand-sorts smt-bls-result-sort
           smt-true smt-false smt-and smt-or smt-eq smt-imp smt-ne-zero smt-conj
           smt-sort-of smt->smtlib run-z3 z3-check z3-model z3-raw
           ;; UPLC -> SMT denotational compiler

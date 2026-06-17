@@ -19,14 +19,22 @@
 ;;; — never a silent under-approximation.
 ;;;
 ;;; Soundness posture (R1): every construct the symbolic domain cannot represent
-;;; first-order — a genuinely symbolic non-arithmetic builtin, a symbolic-constant
-;;; case scrutinee, an unsupported builtin — returns #f (refuse), never a wrong
-;;; answer.  The supported first-order fragment is: integer arithmetic/comparison,
-;;; ifThenElse (concrete or symbolic-boolean control flow), trace/chooseUnit
-;;; (pass-through), the Data injections/projections (iData/bData/unIData/unBData/
-;;; unConstrData/unListData), fstPair/sndPair, headList/tailList/nullList,
-;;; lengthOfByteString, and equalsData/equalsByteString.  constr/case and
-;;; lambda/delay/force/apply are fully supported (defunctionalized).
+;;; first-order — a genuinely symbolic unsupported builtin, a closure case
+;;; scrutinee, an unsupported builtin — returns #f (refuse), never a wrong answer.
+;;; The supported first-order fragment is:
+;;;   * integer arithmetic/comparison; equalsData/equalsByteString; lengthOfByteString;
+;;;   * ifThenElse (concrete or symbolic-boolean control flow); trace/chooseUnit
+;;;     (pass-through); chooseData/chooseList/mkCons on concrete operands;
+;;;   * Data injections/projections: iData/bData/unIData/unBData/unConstrData/unListData;
+;;;     fstPair/sndPair; headList/tailList/nullList;
+;;;   * the cryptographic hashes (sha2_256/sha3_256/blake2b_256/blake2b_224/keccak_256/
+;;;     ripemd_160), serialiseData, BLS12-381 (G1/G2/pairing) ops, and the three
+;;;     signature-verification primitives — all axiomatized as uninterpreted SMT
+;;;     functions (z3 reasons about them abstractly: x=y -> f x = f y);
+;;;   * lambda/delay/force/apply, constr, and case — fully supported (defunctionalized).
+;;;     `case` dispatches not only on a `constr` value but on a builtin scrutinee:
+;;;     a builtin *constant* (Bool/Unit/Integer/list/pair) by sum-of-products, and a
+;;;     (possibly symbolic) Bool/Integer/list/pair `scon` by `ite`-combination.
 ;;;
 ;;; Builtins are identified by their UPLC name.  A `#(builtin desc)` node may
 ;;; carry either a real (plutuss builtins) descriptor record (from the parser or
@@ -113,6 +121,29 @@
           (else (nth? (cdr lst) (fx- n 1)))))
 
   (define (sort-pair? s) (and (pair? s) (eq? (car s) 'pair)))
+
+  ;; Symbolic analogue of the machine's `case-on-constant`: a builtin *constant*
+  ;; scrutinee of a `Case` is dispatched as a sum-of-products value
+  ;; (tag, #ctors, fields).  Returns (list tag numCtors fields) or #f.  Fields of
+  ;; a list/pair are carried as `sconst` (so `γ` is pointwise the machine's vcon).
+  ;; Mirrors `symConstToTagFields` (Bool: False=0/True=1, 2 ctors; Unit=0, 1 ctor;
+  ;; Integer n>=0 = tag n with 0 ctors = unbounded; list Cons=0/Nil=1; Pair=0).
+  (define (sym-const->tag-fields c)        ; c = (type . value)
+    (let ((ty (car c)) (v (cdr c)))
+      (cond
+       ((eq? ty 'bool)    (if v (list 1 2 '()) (list 0 2 '())))
+       ((eq? ty 'unit)    (list 0 1 '()))
+       ((eq? ty 'integer) (and (>= v 0) (list v 0 '())))
+       ((and (pair? ty) (eq? (car ty) 'list))
+        (let ((et (cadr ty)))                                  ; element type
+          (if (null? v)
+              (list 1 2 '())                                   ; Nil  = tag 1
+              (list 0 2 (list (sval-const (cons et (car v)))   ; head : et
+                              (sval-const (cons ty (cdr v))))))))  ; tail : (list et)
+       ((and (pair? ty) (eq? (car ty) 'pair))
+        (list 0 1 (list (sval-const (cons (cadr ty) (car v)))    ; fst : fst-type
+                        (sval-const (cons (caddr ty) (cdr v)))))) ; snd : snd-type
+       (else #f))))
 
   ;;; ======================================================================
   ;;; Constants.  A UPLC constant is (type . value).  Integer/Bool become an
@@ -224,6 +255,16 @@
     (and (smt-sort=? (smt-sort-of e) (smt-sort-list 'data)) (cons (mk e) (smt-not (smt-null e)))))
   (define (list-op-t mk e)
     (and (smt-sort=? (smt-sort-of e) (smt-sort-list 'data)) (cons (mk e) smt-true)))
+  ;; A BLS binary/mixed op committing on its two declared operand sorts (axiomatized).
+  (define (bls-bin-build op ex ey)
+    (let ((os (smt-bls-operand-sorts op)))
+      (and (smt-sort=? (smt-sort-of ex) (car os)) (smt-sort=? (smt-sort-of ey) (cdr os))
+           (cons (smt-bls-bin op ex ey) smt-true))))
+  ;; A signature-verification op committing on three `bytes`-sorted operands (axiomatized).
+  (define (verify-sig-build kind pk msg sig)
+    (and (smt-sort=? (smt-sort-of pk) 'bytes) (smt-sort=? (smt-sort-of msg) 'bytes)
+         (smt-sort=? (smt-sort-of sig) 'bytes)
+         (cons (smt-verify-sig kind pk msg sig) smt-true)))
 
   (define (smt-builtin name args)
     (case (length args)
@@ -242,6 +283,21 @@
           ((string=? name "tailList") (list-op-ne smt-tail e))
           ((string=? name "nullList") (list-op-t smt-null e))
           ((string=? name "lengthOfByteString") (uop-build 'len-bytes smt-true 'bytes e))
+          ;; cryptographic hashes (bytes -> bytes, axiomatized as uninterpreted fns)
+          ((string=? name "sha2_256")    (uop-build 'sha2-256 smt-true 'bytes e))
+          ((string=? name "sha3_256")    (uop-build 'sha3-256 smt-true 'bytes e))
+          ((string=? name "blake2b_256") (uop-build 'blake2b-256 smt-true 'bytes e))
+          ((string=? name "blake2b_224") (uop-build 'blake2b-224 smt-true 'bytes e))
+          ((string=? name "keccak_256")  (uop-build 'keccak-256 smt-true 'bytes e))
+          ((string=? name "ripemd_160")  (uop-build 'ripemd-160 smt-true 'bytes e))
+          ((string=? name "serialiseData") (uop-build 'serialise-data smt-true 'data e)) ; data -> bytes
+          ;; BLS12-381 unary (bytes -> bytes; elements as compressed bytes)
+          ((string=? name "bls12_381_G1_neg") (uop-build 'bls-g1-neg smt-true 'bytes e))
+          ((string=? name "bls12_381_G2_neg") (uop-build 'bls-g2-neg smt-true 'bytes e))
+          ((string=? name "bls12_381_G1_compress") (uop-build 'bls-g1-compress smt-true 'bytes e))
+          ((string=? name "bls12_381_G2_compress") (uop-build 'bls-g2-compress smt-true 'bytes e))
+          ((string=? name "bls12_381_G1_uncompress") (uop-build 'bls-g1-uncompress smt-true 'bytes e))
+          ((string=? name "bls12_381_G2_uncompress") (uop-build 'bls-g2-uncompress smt-true 'bytes e))
           (else #f))))
       ((2)
        (let ((ey (car args)) (ex (cadr args)))
@@ -258,6 +314,27 @@
           ((string=? name "lessThanEqualsInteger") (sort-bin 'le smt-true 'int ex ey))
           ((string=? name "equalsData")            (sort-bin 'eq smt-true 'data ex ey))
           ((string=? name "equalsByteString")      (sort-bin 'eq smt-true 'bytes ex ey))
+          ;; BLS12-381 binary / mixed (operand1 = ex = 1st UPLC arg, operand2 = ey)
+          ((string=? name "bls12_381_G1_add")         (bls-bin-build 'g1-add ex ey))
+          ((string=? name "bls12_381_G2_add")         (bls-bin-build 'g2-add ex ey))
+          ((string=? name "bls12_381_mulMlResult")    (bls-bin-build 'mul-ml-result ex ey))
+          ((string=? name "bls12_381_G1_hashToGroup") (bls-bin-build 'g1-hash-to-group ex ey))
+          ((string=? name "bls12_381_G2_hashToGroup") (bls-bin-build 'g2-hash-to-group ex ey))
+          ((string=? name "bls12_381_millerLoop")     (bls-bin-build 'miller-loop ex ey))
+          ((string=? name "bls12_381_G1_equal")       (bls-bin-build 'g1-equal ex ey))
+          ((string=? name "bls12_381_G2_equal")       (bls-bin-build 'g2-equal ex ey))
+          ((string=? name "bls12_381_finalVerify")    (bls-bin-build 'final-verify ex ey))
+          ;; scalarMul: scalar (ex, int) x point (ey, bytes)
+          ((string=? name "bls12_381_G1_scalarMul")   (bls-bin-build 'g1-scalar-mul ex ey))
+          ((string=? name "bls12_381_G2_scalarMul")   (bls-bin-build 'g2-scalar-mul ex ey))
+          (else #f))))
+      ((3)
+       ;; reversed args: signature, message, pubkey
+       (let ((eSig (car args)) (eMsg (cadr args)) (ePk (caddr args)))
+         (cond
+          ((string=? name "verifyEd25519Signature")          (verify-sig-build 'ed25519 ePk eMsg eSig))
+          ((string=? name "verifyEcdsaSecp256k1Signature")   (verify-sig-build 'ecdsa ePk eMsg eSig))
+          ((string=? name "verifySchnorrSecp256k1Signature") (verify-sig-build 'schnorr ePk eMsg eSig))
           (else #f))))
       (else #f)))
 
@@ -266,9 +343,20 @@
   (define (passthrough-builtin? name)
     (member name '("ifThenElse" "chooseUnit" "trace" "chooseData" "chooseList" "mkCons")))
 
-  ;; ifThenElse / trace / chooseUnit.  ifThenElse with a concrete boolean picks
-  ;; the branch; with a symbolic boolean and first-order branches it becomes an
-  ;; SMT `ite`, otherwise a deferred `site`.  trace s v = v ; chooseUnit u v = v.
+  ;; recognise a fully concrete `sconst` of a given const type ('unit 'string ...)
+  (define (sconst-of-type? v ty) (and (eq? (sym-vtag v) 'sconst) (eq? (car (sconst-c v)) ty)))
+  ;; recognise a fully concrete list-typed `sconst`; returns its (type . items) const or #f
+  (define (sconst-list v)
+    (and (eq? (sym-vtag v) 'sconst)
+         (let ((c (sconst-c v))) (and (pair? (car c)) (eq? (caar c) 'list) c))))
+
+  ;; Pass-through builtins (return one of their value arguments).  Mirrors
+  ;; symBuiltinPassThrough.  Args arrive newest-first.
+  ;;   ifThenElse: concrete bool picks the branch; symbolic bool with first-order
+  ;;     branches becomes an SMT `ite`, otherwise a deferred `site`.
+  ;;   trace s v = v ; chooseUnit u v = v  (the discriminant must be concrete).
+  ;;   chooseData / chooseList: dispatch on a *concrete* Data variant / list-empty.
+  ;;   mkCons x xs: cons a concrete element onto a concrete list.
   (define (sym-builtin-passthrough b args)
     (let ((name (builtin-name b)))
       (cond
@@ -285,10 +373,32 @@
                             (sout (sval-con (smt-ite condE (scon-e thenV) (scon-e elseV))) smt-true)
                             (sout (sval-ite condE thenV elseV) smt-true)))
                        (else #f)))))))
-       ((string=? name "trace")
-        (and (fx=? (length args) 2) (sout (car args) smt-true)))      ; (trace s v) -> v
-       ((string=? name "chooseUnit")
-        (and (fx=? (length args) 2) (sout (car args) smt-true)))      ; (chooseUnit u v) -> v
+       ((string=? name "chooseUnit")    ; [result, sConst Unit] -> result
+        (and (fx=? (length args) 2) (sconst-of-type? (cadr args) 'unit)
+             (sout (car args) smt-true)))
+       ((string=? name "trace")         ; [result, sConst (String _)] -> result
+        (and (fx=? (length args) 2) (sconst-of-type? (cadr args) 'string)
+             (sout (car args) smt-true)))
+       ((string=? name "chooseData")    ; [bC iC lC mC cC (sConst (Data d))] -> branch by variant
+        (and (fx=? (length args) 6) (sconst-of-type? (list-ref args 5) 'data)
+             (let ((branch (case (car (cdr (sconst-c (list-ref args 5))))   ; (car data-value)
+                             ((Constr) (list-ref args 4))    ; cC
+                             ((Map)    (list-ref args 3))    ; mC
+                             ((List)   (list-ref args 2))    ; lC
+                             ((I)      (list-ref args 1))    ; iC
+                             ((B)      (list-ref args 0))    ; bC
+                             (else #f))))
+               (and branch (sout branch smt-true)))))
+       ((string=? name "chooseList")    ; [consC, nilC, (sConst list)] -> nilC if empty else consC
+        (and (fx=? (length args) 3)
+             (let ((lc (sconst-list (list-ref args 2))))
+               (and lc (sout (if (null? (cdr lc)) (list-ref args 1) (list-ref args 0)) smt-true)))))
+       ((string=? name "mkCons")        ; [sConst(list tl), sConst x] -> sConst(list (x::tl))
+        (and (fx=? (length args) 2)
+             (let ((lc (sconst-list (car args))) (x (cadr args)))
+               (and lc (eq? (sym-vtag x) 'sconst)
+                    (equal? (car (sconst-c x)) (cadr (car lc)))   ; element type matches list ET
+                    (sout (sval-const (cons (car lc) (cons (cdr (sconst-c x)) (cdr lc)))) smt-true)))))
        (else #f))))
 
   ;; extract argument exprs from `scon`-wrapped values; #f if any is not scon.
@@ -408,10 +518,13 @@
                                              (sout (sout-value oap)
                                                    (smt-and (sout-defined osc)
                                                             (smt-and (sout-defined oalt) (sout-defined oap)))))))))))
-                       ((eq? (sym-vtag sv) 'site)
+                       ;; symbolic choice (site), builtin constant (sconst, SOP
+                       ;; dispatch), or (possibly symbolic) Bool/Integer/list/pair
+                       ;; scalar (scon) ==> dispatch through sym-case
+                       ((memq (sym-vtag sv) '(site sconst scon))
                         (let ((oc (sym-case n env sv alts)))
                           (and oc (sout (sout-value oc) (smt-and (sout-defined osc) (sout-defined oc))))))
-                       (else #f))))))         ; symbolic-constant scrutinee => refuse (R1)
+                       (else #f))))))         ; a closure scrutinee => genuinely ill-typed => refuse
             ((uerror) #f)
             (else (error 'sym-eval "bad term" t))))))
 
@@ -480,7 +593,73 @@
              (combine-ite (site-cond sv)
                           (sym-case fuel env (site-a sv) alts)
                           (sym-case fuel env (site-b sv) alts)))
+            ((sconst) (sym-case-const n env (sconst-c sv) alts))
+            ((scon)   (sym-case-scon n env (scon-e sv) alts))
             (else #f)))))
+
+  ;; `Case` on a builtin *constant* scrutinee (Bool/Unit/Integer/list/pair): SOP
+  ;; dispatch via `sym-const->tag-fields` (mirrors symCase's `.sConst` clause).
+  (define (sym-case-const n env c alts)
+    (let ((tf (sym-const->tag-fields c)))
+      (and tf
+           (let ((tag (car tf)) (numctors (cadr tf)) (fields (caddr tf)))
+             (if (and (fx>? numctors 0) (fx>? (length alts) numctors))
+                 #f
+                 (let ((alt (nth? alts tag)))
+                   (and alt
+                        (let ((oalt (sym-eval n env alt)))
+                          (and oalt
+                               (let ((oap (sym-apply-list n (sout-value oalt) fields)))
+                                 (and oap (sout (sout-value oap)
+                                                (smt-and (sout-defined oalt) (sout-defined oap))))))))))))))
+
+  ;; `Case` on a (possibly symbolic) first-order `scon` scrutinee.  Bool: tags
+  ;; False=0/True=1 ⇒ `ite e alt1 alt0`.  Integer: tag = value ⇒ nested
+  ;; `ite (e==i) altᵢ …`.  list data: Cons=0 (head/tail fields)/Nil=1 ⇒ split on
+  ;; `nullL`.  pair: a single ctor (tag 0) with fst/snd fields.  Mirrors symCase's
+  ;; `.sCon` clause.
+  (define (sym-case-scon n env e alts)
+    (let ((s (smt-sort-of e)))
+      (cond
+       ((eq? s 'bool)
+        (and (fx<=? (length alts) 2)
+             (combine-ite e
+                          (let ((a (nth? alts 1))) (and a (sym-eval n env a)))
+                          (let ((a (nth? alts 0))) (and a (sym-eval n env a))))))
+       ((eq? s 'int)
+        (sym-case-int n env e 0 alts))
+       ((equal? s (smt-sort-list 'data))
+        (and (fx<=? (length alts) 2)
+             (combine-ite (smt-null e)
+                          (let ((a (nth? alts 1))) (and a (sym-eval n env a)))       ; nil  = tag 1
+                          (let ((a (nth? alts 0)))                                    ; cons = tag 0
+                            (and a
+                                 (let ((oa (sym-eval n env a)))
+                                   (and oa
+                                        (let ((oap (sym-apply-list n (sout-value oa)
+                                                     (list (sval-con (smt-head 'data e))
+                                                           (sval-con (smt-tail e))))))
+                                          (and oap (sout (sout-value oap)
+                                                         (smt-and (sout-defined oa) (sout-defined oap))))))))))))
+       ((sort-pair? s)
+        (and (fx<=? (length alts) 1)
+             (let ((a (nth? alts 0)))
+               (and a
+                    (let ((oa (sym-eval n env a)))
+                      (and oa
+                           (let ((oap (sym-apply-list n (sout-value oa)
+                                        (list (sval-con (smt-fst e)) (sval-con (smt-snd e))))))
+                             (and oap (sout (sout-value oap)
+                                            (smt-and (sout-defined oa) (sout-defined oap)))))))))))
+       (else #f))))
+
+  ;; Nested `ite` for a symbolic-integer `Case`: ite (e==i) altᵢ (… (e==i+1) …),
+  ;; bottoming out at the empty alt-list as undefined.  Mirrors symCaseInt.
+  (define (sym-case-int n env e i alts)
+    (if (null? alts) #f
+        (combine-ite (smt-bin 'eq e (smt-int i))
+                     (sym-eval n env (car alts))
+                     (sym-case-int n env e (fx+ i 1) (cdr alts)))))
 
   ;;; ======================================================================
   ;;; Top-level interface.

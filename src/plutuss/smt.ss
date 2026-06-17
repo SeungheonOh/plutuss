@@ -40,6 +40,7 @@
    ;; expression constructors
    smt-var smt-int smt-bool smt-neg smt-not smt-bin smt-uop smt-ite
    smt-mkpair smt-fst smt-snd smt-nil smt-cons smt-head smt-tail smt-null
+   smt-verify-sig smt-bls-bin smt-bls-operand-sorts smt-bls-result-sort
    ;; smart constructors / helpers
    smt-true smt-false smt-and smt-or smt-eq smt-imp smt-ne-zero smt-conj
    ;; introspection
@@ -83,6 +84,22 @@
   (define (smt-head s e)      (vector 'headl s e))
   (define (smt-tail e)        (vector 'taill e))
   (define (smt-null e)        (vector 'nulll e))
+  ;; Axiomatized signature verification (kind: ed25519 | ecdsa | schnorr) and BLS
+  ;; binary/mixed ops (op: g1-add g2-add mul-ml-result g1-hash-to-group
+  ;; g2-hash-to-group miller-loop g1-equal g2-equal final-verify g1-scalar-mul
+  ;; g2-scalar-mul).  Mirror moist's `verifySig` / `blsBin`.
+  (define (smt-verify-sig kind pk msg sig) (vector 'verifysig kind pk msg sig))
+  (define (smt-bls-bin op a b)             (vector 'blsbin op a b))
+
+  ;; BLS binary op metadata (mirrors BlsBinOp.operandSorts / .resultSort).
+  (define (smt-bls-operand-sorts op)
+    (case op
+      ((g1-scalar-mul g2-scalar-mul) (cons 'int 'bytes))
+      (else (cons 'bytes 'bytes))))
+  (define (smt-bls-result-sort op)
+    (case op
+      ((g1-equal g2-equal final-verify) 'bool)
+      (else 'bytes)))
 
   (define (smt-tag e) (vector-ref e 0))
 
@@ -125,6 +142,12 @@
       ((dargs) (cons 'data (list 'list 'data)))
       ((ditems) (cons 'data (list 'list 'data)))
       ((dentries) (cons 'data (list 'list (list 'pair 'data 'data))))
+      ;; cryptographic hashes (bytes -> bytes), axiomatized as uninterpreted fns
+      ((sha2-256 sha3-256 blake2b-256 blake2b-224 keccak-256 ripemd-160) (cons 'bytes 'bytes))
+      ((serialise-data) (cons 'data 'bytes))            ; data -> bytes (CBOR), axiomatized
+      ;; BLS12-381 unary ops (bytes -> bytes; elements as compressed bytes)
+      ((bls-g1-neg bls-g2-neg bls-g1-compress bls-g2-compress bls-g1-uncompress bls-g2-uncompress)
+       (cons 'bytes 'bytes))
       (else (cons #f #f))))
 
   (define (smt-sort-of e)
@@ -157,6 +180,12 @@
          (and (sort-list? sa) (smt-sort=? s (cadr sa)) s)))
       ((taill a) (let ((sa (smt-sort-of a))) (and (sort-list? sa) sa)))
       ((nulll a) (let ((sa (smt-sort-of a))) (and (sort-list? sa) 'bool)))
+      ((verifysig _ a b c)
+       (and (eq? (smt-sort-of a) 'bytes) (eq? (smt-sort-of b) 'bytes)
+            (eq? (smt-sort-of c) 'bytes) 'bool))
+      ((blsbin op a b)
+       (let ((sa (smt-sort-of a)) (sb (smt-sort-of b)) (os (smt-bls-operand-sorts op)))
+         (and sa sb (smt-sort=? sa (car os)) (smt-sort=? sb (cdr os)) (smt-bls-result-sort op))))
       (else #f)))
 
   (define (smt-well-sorted-bool? e) (eq? (smt-sort-of e) 'bool))
@@ -196,7 +225,37 @@
       ((dargs) (string-append "(cArgs " s ")"))
       ((ditems) (string-append "(lItems " s ")"))
       ((dentries) (string-append "(mEntries " s ")"))
+      ((sha2-256) (string-append "(pl_sha2_256 " s ")"))
+      ((sha3-256) (string-append "(pl_sha3_256 " s ")"))
+      ((blake2b-256) (string-append "(pl_blake2b_256 " s ")"))
+      ((blake2b-224) (string-append "(pl_blake2b_224 " s ")"))
+      ((keccak-256) (string-append "(pl_keccak_256 " s ")"))
+      ((ripemd-160) (string-append "(pl_ripemd_160 " s ")"))
+      ((serialise-data) (string-append "(pl_serialiseData " s ")"))
+      ((bls-g1-neg) (string-append "(pl_bls_g1_neg " s ")"))
+      ((bls-g2-neg) (string-append "(pl_bls_g2_neg " s ")"))
+      ((bls-g1-compress) (string-append "(pl_bls_g1_compress " s ")"))
+      ((bls-g2-compress) (string-append "(pl_bls_g2_compress " s ")"))
+      ((bls-g1-uncompress) (string-append "(pl_bls_g1_uncompress " s ")"))
+      ((bls-g2-uncompress) (string-append "(pl_bls_g2_uncompress " s ")"))
       (else (error 'smt "bad uop" op))))
+
+  ;; SMT-LIB function name for a BLS binary/mixed op (mirrors blsBinName).
+  (define (bls-bin-name op)
+    (case op
+      ((g1-add) "pl_bls_g1_add") ((g2-add) "pl_bls_g2_add")
+      ((mul-ml-result) "pl_bls_mulMlResult")
+      ((g1-hash-to-group) "pl_bls_g1_hashToGroup") ((g2-hash-to-group) "pl_bls_g2_hashToGroup")
+      ((miller-loop) "pl_bls_millerLoop")
+      ((g1-equal) "pl_bls_g1_equal") ((g2-equal) "pl_bls_g2_equal")
+      ((final-verify) "pl_bls_finalVerify")
+      ((g1-scalar-mul) "pl_bls_g1_scalarMul") ((g2-scalar-mul) "pl_bls_g2_scalarMul")
+      (else (error 'smt "bad blsbin" op))))
+
+  (define (verify-sig-name kind)
+    (case kind
+      ((ed25519) "pl_verifyEd25519") ((ecdsa) "pl_verifyEcdsa") ((schnorr) "pl_verifySchnorr")
+      (else (error 'smt "bad verify kind" kind))))
 
   (define (smt->sexpr e)
     (match e
@@ -215,7 +274,18 @@
       ((consl h t) (string-append "(lcons " (smt->sexpr h) " " (smt->sexpr t) ")"))
       ((headl _ a) (string-append "(lhead " (smt->sexpr a) ")"))
       ((taill a) (string-append "(ltail " (smt->sexpr a) ")"))
-      ((nulll a) (string-append "((_ is lnil) " (smt->sexpr a) ")"))
+      ;; emptiness test.  `lnil` is a constructor of the *polymorphic* `Lst`, so
+      ;; the bare tester `((_ is lnil) x)` is ambiguous to z3; test equality to
+      ;; the sort-qualified empty list instead (`(as lnil (Lst S))`).
+      ((nulll a) (string-append "(= " (smt->sexpr a) " (as lnil " (sort-name (smt-sort-of a)) "))"))
+      ((verifysig kind a b c)
+       (string-append "(" (verify-sig-name kind) " " (smt->sexpr a) " "
+                      (smt->sexpr b) " " (smt->sexpr c) ")"))
+      ;; G1/G2 equality + final pairing-check are real (structural) equality
+      ((blsbin op a b)
+       (if (memq op '(g1-equal g2-equal final-verify))
+           (string-append "(= " (smt->sexpr a) " " (smt->sexpr b) ")")
+           (string-append "(" (bls-bin-name op) " " (smt->sexpr a) " " (smt->sexpr b) ")")))
       (else (error 'smt "bad expr" e))))
 
   ;; Collect (name . sort) of free variables, de-duplicated, first-seen order.
@@ -229,7 +299,9 @@
           ((fstp a) (go a)) ((sndp a) (go a)) ((headl _ a) (go a))
           ((taill a) (go a)) ((nulll a) (go a))
           ((bin _ a b) (go a) (go b)) ((mkpair a b) (go a) (go b)) ((consl a b) (go a) (go b))
+          ((blsbin _ a b) (go a) (go b))
           ((ite a b c) (go a) (go b) (go c))
+          ((verifysig _ a b c) (go a) (go b) (go c))
           (else (error 'smt "bad expr in collect-vars" e))))
       (reverse acc)))
 
@@ -256,16 +328,51 @@
      "(mkMap (mEntries (Lst (Pair Data Data)))) (mkDList (lItems (Lst Data))) "
      "(mkI (iVal Int)) (mkB (bVal String)))))\n"))
 
+  ;; Uninterpreted declarations for the axiomatized cryptographic builtins
+  ;; (hashes/serialiseData/BLS are String->String, ByteStrings modelled as SMT
+  ;; Strings; signature verification and pairing checks return Bool).  z3 reasons
+  ;; about them abstractly (only x=y -> f x = f y).  Mirrors moist's cryptoPreamble.
+  (define smt-crypto-preamble
+    (string-append
+     "(declare-fun pl_sha2_256 (String) String)\n"
+     "(declare-fun pl_sha3_256 (String) String)\n"
+     "(declare-fun pl_blake2b_256 (String) String)\n"
+     "(declare-fun pl_blake2b_224 (String) String)\n"
+     "(declare-fun pl_keccak_256 (String) String)\n"
+     "(declare-fun pl_ripemd_160 (String) String)\n"
+     "(declare-fun pl_serialiseData (Data) String)\n"
+     "(declare-fun pl_verifyEd25519 (String String String) Bool)\n"
+     "(declare-fun pl_verifyEcdsa (String String String) Bool)\n"
+     "(declare-fun pl_verifySchnorr (String String String) Bool)\n"
+     "(declare-fun pl_bls_g1_neg (String) String)\n"
+     "(declare-fun pl_bls_g2_neg (String) String)\n"
+     "(declare-fun pl_bls_g1_compress (String) String)\n"
+     "(declare-fun pl_bls_g2_compress (String) String)\n"
+     "(declare-fun pl_bls_g1_uncompress (String) String)\n"
+     "(declare-fun pl_bls_g2_uncompress (String) String)\n"
+     "(declare-fun pl_bls_g1_add (String String) String)\n"
+     "(declare-fun pl_bls_g2_add (String String) String)\n"
+     "(declare-fun pl_bls_mulMlResult (String String) String)\n"
+     "(declare-fun pl_bls_g1_hashToGroup (String String) String)\n"
+     "(declare-fun pl_bls_g2_hashToGroup (String String) String)\n"
+     "(declare-fun pl_bls_millerLoop (String String) String)\n"
+     "(declare-fun pl_bls_g1_equal (String String) Bool)\n"
+     "(declare-fun pl_bls_g2_equal (String String) Bool)\n"
+     "(declare-fun pl_bls_finalVerify (String String) Bool)\n"
+     "(declare-fun pl_bls_g1_scalarMul (Int String) String)\n"
+     "(declare-fun pl_bls_g2_scalarMul (Int String) String)\n"))
+
   ;; Serialize an `smt` expression to a complete SMT-LIB script: logic, the
-  ;; Data datatype + division preambles, variable declarations, the assertion,
-  ;; and (check-sat).  An `unsat` verdict certifies the expression has no model.
+  ;; Data datatype + crypto + division preambles, variable declarations, the
+  ;; assertion, and (check-sat).  An `unsat` verdict certifies the expression
+  ;; has no model.
   (define (smt->smtlib e)
     (let* ((vars (smt-collect-vars e))
            (decls (apply string-append
                          (map (lambda (p)
                                 (string-append "(declare-const " (car p) " " (sort-name (cdr p)) ")\n"))
                               vars))))
-      (string-append "(set-logic ALL)\n" smt-data-preamble smt-preamble decls
+      (string-append "(set-logic ALL)\n" smt-data-preamble smt-crypto-preamble smt-preamble decls
                      "(assert " (smt->sexpr e) ")\n" "(check-sat)\n")))
 
   ;;; ======================================================================

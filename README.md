@@ -168,11 +168,22 @@ compile to nested SMT `ite`s), and refuting a false claim with a counterexample.
 **Supported first-order fragment** (everything else is *refused* — returns `#f`,
 the sound failure mode, never a wrong answer): integer arithmetic and
 comparison; `ifThenElse` (concrete or symbolic-boolean control flow, the latter
-compiled to an SMT `ite`); `trace`/`chooseUnit` (pass-through); the `Data`
-injections/projections (`iData`/`bData`/`unIData`/`unBData`/`unConstrData`/
-`unListData`), `fstPair`/`sndPair`, `headList`/`tailList`/`nullList`,
-`lengthOfByteString`, and `equalsData`/`equalsByteString`. Lambda, delay,
-force, apply, `constr` and `case` are fully supported (defunctionalized).
+compiled to an SMT `ite`); `trace`/`chooseUnit`, and `chooseData`/`chooseList`/
+`mkCons` on concrete operands (pass-through); the `Data` injections/projections
+(`iData`/`bData`/`unIData`/`unBData`/`unConstrData`/`unListData`),
+`fstPair`/`sndPair`, `headList`/`tailList`/`nullList`, `lengthOfByteString`,
+`equalsData`/`equalsByteString`; and the cryptographic hashes (`sha2_256`,
+`sha3_256`, `blake2b_256`, `blake2b_224`, `keccak_256`, `ripemd_160`),
+`serialiseData`, the BLS12-381 G1/G2/pairing ops, and the three
+signature-verification primitives — all **axiomatized as uninterpreted SMT
+functions** (z3 reasons about them abstractly, `x = y → f x = f y`, so e.g.
+`sha2_256 a = sha2_256 b` does *not* prove `a = b`). Lambda, delay, force,
+apply, `constr`, and `case` are fully supported (defunctionalized) — and `case`
+dispatches not only on a `constr` value but on a builtin scrutinee: a builtin
+*constant* (`Bool`/`Unit`/`Integer`/list/pair) by sum-of-products, and a
+(possibly symbolic) `Bool`/`Integer`/list/pair value by `ite`-combination (so a
+`case` over `unListData d` or `unConstrData d` for a symbolic `d` splits into the
+`Cons`/`Nil` or field branches).
 
 **Partiality** is carried as a separate definedness guard, never as a partial
 meaning, so `(x*y)/y = x` is `sat` with no precondition (z3 finds `y=0`) but
