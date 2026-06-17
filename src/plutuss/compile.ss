@@ -50,8 +50,6 @@
    compile-term compile-success compile-property
    ;; concrete-fold hook (off by default; see notes)
    current-concrete-builtin
-   ;; FFI-free term constructors (for building ASTs without the parser/DSL)
-   t-var t-con t-builtin t-lam t-delay t-force t-app t-app* t-constr t-case t-error
    ;; constant helpers
    c-integer c-bool c-bytestring c-unit c-data const->sym
    ;; builtin metadata
@@ -510,20 +508,4 @@
   ;; Compile to the z3-ready property formula, given a precondition `pre`.
   (define (compile-property t env pre . opt)
     (let ((s (apply compile-success t env opt)))
-      (and s (encode-property pre s))))
-
-  ;;; ======================================================================
-  ;;; FFI-free term constructors (build de-Bruijn ASTs directly; builtins by
-  ;;; name string).  Match (plutuss machine)'s term shapes exactly.
-  ;;; ======================================================================
-  (define (t-var k) (vector 'var k))
-  (define (t-con c) (vector 'con c))
-  (define (t-builtin name) (vector 'builtin name))   ; name is a string/symbol
-  (define (t-lam body) (vector 'lam "_" body))        ; de-Bruijn: binder name is cosmetic
-  (define (t-delay body) (vector 'delay body))
-  (define (t-force body) (vector 'force body))
-  (define (t-app f a) (vector 'app f a))
-  (define (t-app* f . args) (fold-left (lambda (g a) (vector 'app g a)) f args))
-  (define (t-constr tag fields) (vector 'constr tag fields))
-  (define (t-case scrut branches) (vector 'case scrut branches))
-  (define (t-error) (vector 'uerror)))
+      (and s (encode-property pre s)))))

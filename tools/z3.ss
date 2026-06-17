@@ -1,7 +1,5 @@
 ;;; tools/z3.ss — a direct z3 runner and a self-testing demo of the
-;;; UPLC -> SMT compiler.  FFI-free: imports only (plutuss smt) and
-;;; (plutuss compile), so it runs anywhere z3 is on PATH, without plutuss's
-;;; native crypto libraries.
+;;; UPLC -> SMT compiler.
 ;;;
 ;;; Usage:
 ;;;   chez --script tools/z3.ss --smt2 <file.smt2>   run z3 on a raw SMT-LIB
@@ -9,9 +7,13 @@
 ;;;   chez --script tools/z3.ss --demo               compile a suite of example
 ;;;                                                   validators and prove them
 ;;;   chez --script tools/z3.ss --help
+;;;
+;;; The example validators are built with the (plutuss dsl) `uplc` macro, so this
+;;; loads plutuss's native crypto libraries like the rest of the system; the
+;;; (plutuss smt) and (plutuss compile) layers it exercises remain FFI-free.
 (import (chezscheme))
 (library-directories (list "src"))
-(import (plutuss smt) (plutuss compile))
+(import (plutuss smt) (plutuss compile) (plutuss dsl) (plutuss frontend))
 
 (define (usage)
   (display "Usage:\n")
@@ -38,21 +40,22 @@
 ;;; ----------------------------------------------------------------------
 ;;; Demo: compile example validators and prove them with z3.
 ;;; ----------------------------------------------------------------------
-(define (bi n) (t-builtin n))
-(define (ci n) (t-con (c-integer n)))
-(define (cb v) (t-con (c-bool v)))
-(define (le a b) (t-app* (bi "lessThanEqualsInteger") a b))
-(define (lt a b) (t-app* (bi "lessThanInteger") a b))
-(define (mul a b) (t-app* (bi "multiplyInteger") a b))
-(define (add a b) (t-app* (bi "addInteger") a b))
-(define (sub a b) (t-app* (bi "subtractInteger") a b))
-(define (eqi a b) (t-app* (bi "equalsInteger") a b))
-(define (divi a b) (t-app* (bi "divideInteger") a b))
-(define (unI e) (t-app (bi "unIData") e))
-(define (lite c t e) (t-force (t-app* (t-force (bi "ifThenElse")) c (t-delay t) (t-delay e))))
+;; Builtins/constants/control flow as DSL term fragments (,a splices a subterm).
+(define (ci n) (uplc (con integer ,n)))
+(define (cb v) (uplc (con bool ,v)))
+(define (le a b)  (uplc ((builtin lessThanEqualsInteger) ,a ,b)))
+(define (lt a b)  (uplc ((builtin lessThanInteger) ,a ,b)))
+(define (mul a b) (uplc ((builtin multiplyInteger) ,a ,b)))
+(define (add a b) (uplc ((builtin addInteger) ,a ,b)))
+(define (sub a b) (uplc ((builtin subtractInteger) ,a ,b)))
+(define (eqi a b) (uplc ((builtin equalsInteger) ,a ,b)))
+(define (divi a b) (uplc ((builtin divideInteger) ,a ,b)))
+(define (unI e)   (uplc ((builtin unIData) ,e)))
+(define (lite c t e) (uplc (force ((force (builtin ifThenElse)) ,c (delay ,t) (delay ,e)))))
 
-(define x1 (t-var 1))
-(define x2 (t-var 2))
+;; The symbolic inputs, as named free variables: x1 = Var 1, x2 = Var 2.
+(define x1 (uplc x))
+(define x2 (uplc y))
 (define xv (smt-var "x" smt-sort-int))
 (define yv (smt-var "y" smt-sort-int))
 (define dv (smt-var "d" smt-sort-data))
@@ -60,13 +63,26 @@
 (define symXY (make-sym-env (symbolic-input "x" smt-sort-int) (symbolic-input "y" smt-sort-int)))
 (define symD  (make-sym-env (symbolic-input "d" smt-sort-data)))
 
+;; Convert a DSL term with free input variables to the de-Bruijn body the
+;; compiler expects.  `names` lists the inputs innermost-first (first = Var 1),
+;; matching make-sym-env: wrap the term in one lambda per input, run the standard
+;; name->debruijn, then strip those lambdas back off.
+(define (body-with names t)
+  (let* ((wrapped (fold-left (lambda (acc nm) (vector 'lam nm acc)) t names))
+         (db (name->debruijn wrapped)))
+    (let peel ((u db) (k (length names)))
+      (if (fx=? k 0) u (peel (vector-ref u 2) (fx- k 1))))))
+
+;; The demo's inputs are always x1 = Var 1 ("x") and (when present) x2 = Var 2 ("y").
+(define (input-names k) (if (fx=? k 2) '("x" "y") '("x")))
+
 (define pass-count 0)
 (define fail-count 0)
 
 ;; prove that `t` (compiled in `env`, under precondition `pre`) meets `expect`
 ;; ('unsat = always-true ; 'sat = counterexample exists).
 (define (expect-case label t env pre expect)
-  (let ((s (compile-success t env)))
+  (let ((s (compile-success (body-with (input-names (length env)) t) env)))
     (if (not s)
         (begin (set! fail-count (+ fail-count 1))
                (printf "  [FAIL] ~a : compile refused\n" label))
@@ -78,11 +94,22 @@
                      (printf "  [FAIL] ~a : got ~a expected ~a\n" label got expect)))))))
 
 ;; Z-combinator recursion: sum(i) = if i<=0 then 0 else i + sum(i-1)
-(define rec-half (t-lam (t-app (t-var 2) (t-lam (t-app* (t-var 2) (t-var 2) (t-var 1))))))
-(define rec-zfix (t-lam (t-app rec-half rec-half)))
-(define rec-body (t-lam (t-lam (lite (le (t-var 1) (ci 0)) (ci 0)
-                                     (add (t-var 1) (t-app (t-var 2) (sub (t-var 1) (ci 1))))))))
-(define rec-validator (le (ci 0) (t-app (t-app rec-zfix rec-body) x1)))
+(define rec-bodyF
+  (uplc
+   (lam rec
+     (lam n
+       (force ((force (builtin ifThenElse))
+               ((builtin lessThanEqualsInteger) n (con integer 0))
+               (delay (con integer 0))
+               (delay ((builtin addInteger)
+                       n
+                       (rec ((builtin subtractInteger) n (con integer 1)))))))))))
+(define rec-zfix
+  (uplc (lam f ((lam h (f (lam a (h h a)))) (lam h (f (lam a (h h a))))))))
+(define rec-validator (le (ci 0) (uplc ((,rec-zfix ,rec-bodyF) ,x1))))
+
+;; (lam a. 0 <= a*a) — reused as a directly-applied lambda and a case branch.
+(define sq-nonneg (uplc (lam a ,(le (ci 0) (mul (uplc a) (uplc a))))))
 
 (define (demo)
   (display "=== UPLC -> SMT compiler demo (z3-backed) ===\n")
@@ -101,9 +128,9 @@
                (lite (le (ci 0) x1) (cb #t) (cb #f)) symX smt-true 'sat)
   (display "Higher-order / data (lambda, constr/case, Data destructure):\n")
   (expect-case "[(lam a. 0<=a*a) x]            (always true)"
-               (t-app (t-lam (le (ci 0) (mul x1 x1))) x1) symX smt-true 'unsat)
+               (uplc (,sq-nonneg ,x1)) symX smt-true 'unsat)
   (expect-case "case(constr0[x]){0->0<=a*a}    (always true)"
-               (t-case (t-constr 0 (list x1)) (list (t-lam (le (ci 0) (mul x1 x1))))) symX smt-true 'unsat)
+               (uplc (case (constr 0 ,x1) ,sq-nonneg)) symX smt-true 'unsat)
   (expect-case "unI d == unI d | isI d         (always true)"
                (eqi (unI x1) (unI x1)) symD (smt-uop 'isi dv) 'unsat)
   (display "Bounded recursion (sum i = if i<=0 then 0 else i+sum(i-1)):\n")

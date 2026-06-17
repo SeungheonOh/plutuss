@@ -197,7 +197,7 @@
   (let ([p (open-input-string s)])
     (read p)))
 
-(define (uplc-pretty ast) (pretty-print (string->sexp (pretty-term (name->debruijn ast)))))
+(define (uplc-pretty ast) (pretty-print (string->sexp (pretty-term ast))))
 
 ;; Evaluate and pretty-print the result as a 1.1.0 program string.
 (define (uplc-run ast) (pretty-program (vector 1 1 0) (uplc-eval ast))))

@@ -26,7 +26,6 @@
           symbolic-input make-sym-env sym-env-extend empty-sym-env
           sym-eval extract encode-property default-fuel
           compile-term compile-success compile-property current-concrete-builtin
-          t-var t-con t-builtin t-lam t-delay t-force t-app t-app* t-constr t-case t-error
           c-integer c-bool c-bytestring c-unit c-data
           builtin-name builtin-arity builtin-forces)
   (import (plutuss base) (plutuss value) (plutuss cbor) (plutuss cost)

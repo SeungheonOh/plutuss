@@ -122,10 +122,20 @@
 
 (define (pp-term term out names)
   (case (vector-ref term 0)
-    ((var) (write-string (list-ref names (fx- (vector-ref term 1) 1)) out))
-    ((lam) (let ((nm (string-append "v" (number->string (length names)))))
-             (write-string "(lam " out) (write-string nm out) (write-string " " out)
-             (pp-term (vector-ref term 2) out (cons nm names)) (write-string ")" out)))
+    ((var)
+     (let ([v (vector-ref term 1)])
+       (cond
+	[(string? v) (write-string v out)]
+	[(symbol? v) (write-string (symbol->string v) out)]
+        [else (write-string (list-ref names (fx- (vector-ref term 1) 1)) out)])))
+    ((lam)
+     (let* ((rnm (vector-ref term 1))
+	    (nm (if (string? rnm) rnm (string-append "v" (number->string (length names))))))
+       (write-string "(lam " out)
+       (write-string nm out)
+       (write-string " " out)
+       (pp-term (vector-ref term 2) out (cons nm names))
+       (write-string ")" out)))
     ((app) (write-string "[" out) (pp-term (vector-ref term 1) out names) (write-string " " out)
      (pp-term (vector-ref term 2) out names) (write-string "]" out))
     ((delay) (write-string "(delay " out) (pp-term (vector-ref term 1) out names) (write-string ")" out))

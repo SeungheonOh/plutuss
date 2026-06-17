@@ -21,12 +21,13 @@
 
 ;; Matching a Some: sum the two integer fields.
 (pr "match Some(1,3) => "
-    (uplc-run
+    (uplc-pretty
      (matchOption
       ,(mkSome (con data (I 1)) (con data (I 3)))
       (Some ([x foo] [y bar])
             [(builtin addInteger) [(builtin unIData) ,x] [(builtin unIData) ,y]])
-      (None () (con integer 42)))))
+      (None () (con integer 42))))
+    )
 
 (pr "match Some(1,3) => "
     (uplc-run

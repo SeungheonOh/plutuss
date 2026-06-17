@@ -129,11 +129,14 @@ and unbounded recursion is handled by `fuel` — bottoming out at a sound
 ```scheme
 (import (chezscheme))
 (library-directories (list "src"))
-(import (plutuss smt) (plutuss compile))     ; both are FFI-free
+(import (plutuss smt) (plutuss compile) (plutuss dsl) (plutuss frontend))
 
-;; validator body  0 <= x*x  with one symbolic integer input x (Var 1)
-(define body (t-app* (t-builtin "lessThanEqualsInteger") (t-con (c-integer 0))
-                     (t-app* (t-builtin "multiplyInteger") (t-var 1) (t-var 1))))
+;; validator  0 <= x*x  as a closed function of its one symbolic integer input x;
+;; name->debruijn it and strip the leading lambda to expose the body (x = Var 1).
+(define validator
+  (uplc (lam x ((builtin lessThanEqualsInteger) (con integer 0)
+                ((builtin multiplyInteger) x x)))))
+(define body (vector-ref (name->debruijn validator) 2))   ; strip the lam
 (define env  (make-sym-env (symbolic-input "x" smt-sort-int)))
 
 ;; compile to the success formula  (defined AND value)  and ask z3
@@ -146,6 +149,21 @@ is defined and returns `true` for every input), `'sat` (a counterexample
 exists — recover it with `z3-model`), or `'unknown`. A precondition `P` is the
 first argument of `encode-property`: `(encode-property P ok)` asks whether
 `P ⇒ success` holds for all inputs.
+
+To see the SMT-LIB *text* the compiler produces — the success formula as an
+s-expression (`smt->sexpr`) and the complete script (`smt->smtlib`: logic, the
+`Data` datatype, the division preamble, `declare-const`s, `assert`, `check-sat`)
+— run `chez --script example-smt.ss`. Building terms with the `uplc` DSL imports
+`(plutuss builtins)`, so it loads the native crypto libraries; the
+`(plutuss smt)` / `(plutuss compile)` layers it drives stay FFI-free.
+
+For a more involved proof, `chez --script example-find.ss` verifies a
+higher-order recursive list function — `find :: (a -> Bool) -> [a] -> Maybe a`,
+with `List` and `Maybe` declared via `define-plutus-type-SOP` (so they are
+SOP-encoded with UPLC `constr`/`case`, which the compiler supports) — proving
+e.g. `forall x. find (== x) [] == Nothing` and the correctness of searching a
+symbolic-element list with a symbolic predicate (the symbolic `ifThenElse`es
+compile to nested SMT `ite`s), and refuting a false claim with a counterexample.
 
 **Supported first-order fragment** (everything else is *refused* — returns `#f`,
 the sound failure mode, never a wrong answer): integer arithmetic and
@@ -189,14 +207,15 @@ coverage on a machine with the native libraries, install one backed by
 chez --script tools/smt.ss --in data --in data --in data validator.uplc
 chez --script tools/smt.ss --in int --emit --model program.uplc
 
-# Direct z3 runner / self-testing demo of the compiler (FFI-free).
+# Direct z3 runner / self-testing demo of the compiler.
 chez --script tools/z3.ss --demo                 # 12 example validators -> z3
 chez --script tools/z3.ss --smt2 query.smt2      # run z3 on a raw SMT-LIB file
 ```
 
-`tools/smt.ss` goes through the full UPLC parser, so (like every other
-file-processing entry point) it loads the native crypto libraries; `tools/z3.ss`
-does not.
+`tools/smt.ss` goes through the full UPLC parser and `tools/z3.ss` builds its
+example terms with the `uplc` DSL, so both (like every other term-building entry
+point) load the native crypto libraries; the `(plutuss smt)` / `(plutuss
+compile)` layers they drive remain FFI-free.
 
 ## Flat (binary) codec
 
