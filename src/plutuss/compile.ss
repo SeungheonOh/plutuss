@@ -26,7 +26,9 @@
 ;;;   * ifThenElse (concrete or symbolic-boolean control flow); trace/chooseUnit
 ;;;     (pass-through); chooseData/chooseList/mkCons on concrete operands;
 ;;;   * Data injections/projections: iData/bData/unIData/unBData/unConstrData/unListData;
-;;;     fstPair/sndPair; headList/tailList/nullList;
+;;;     Data *construction* (symbolic): constrData (symbolic tag AND fields), listData,
+;;;     mkCons / mkNilData on a `list data` (so Data is built from symbolic vars and
+;;;     round-tripped); fstPair/sndPair; headList/tailList/nullList;
 ;;;   * the cryptographic hashes (sha2_256/sha3_256/blake2b_256/blake2b_224/keccak_256/
 ;;;     ripemd_160), serialiseData, BLS12-381 (G1/G2/pairing) ops, and the three
 ;;;     signature-verification primitives — all axiomatized as uninterpreted SMT
@@ -265,6 +267,16 @@
     (and (smt-sort=? (smt-sort-of pk) 'bytes) (smt-sort=? (smt-sort-of msg) 'bytes)
          (smt-sort=? (smt-sort-of sig) 'bytes)
          (cons (smt-verify-sig kind pk msg sig) smt-true)))
+  ;; Symbolic Data construction.  `constrData tag fields`: tag:int, fields:(list data)
+  ;; -> the Data term `mkConstr tag fields` (symbolic on BOTH).
+  (define (constr-data-op tag fields)
+    (and (smt-sort=? (smt-sort-of tag) 'int) (smt-sort=? (smt-sort-of fields) (smt-sort-list 'data))
+         (cons (smt-mk-constr-d tag fields) smt-true)))
+  ;; `mkCons h tl`: prepend a `data` head to a `list data` tail (the only element
+  ;; sort the CEK's ConstDataList supports) -> consL h tl.
+  (define (cons-data-op h tl)
+    (and (smt-sort=? (smt-sort-of h) 'data) (smt-sort=? (smt-sort-of tl) (smt-sort-list 'data))
+         (cons (smt-cons h tl) smt-true)))
 
   (define (smt-builtin name args)
     (case (length args)
@@ -277,6 +289,9 @@
           ((string=? name "unBData") (uop-build 'unbdata (smt-uop 'isb e) 'data e))
           ((string=? name "unConstrData") (unconstr-build e))
           ((string=? name "unListData") (uop-build 'ditems (smt-uop 'islist e) 'data e))
+          ((string=? name "listData") (uop-build 'mk-dlist smt-true (smt-sort-list 'data) e)) ; list data -> Data
+          ;; (mapData -> mkMap deferred, as in moist: the empty ConstPairDataList/ConstDataList
+          ;;  ambiguity; the mkMap UnOp exists in (plutuss smt) but is not dispatched here.)
           ((string=? name "fstPair") (pair-proj smt-fst e))
           ((string=? name "sndPair") (pair-proj smt-snd e))
           ((string=? name "headList") (list-op-ne (lambda (x) (smt-head 'data x)) e))
@@ -314,6 +329,10 @@
           ((string=? name "lessThanEqualsInteger") (sort-bin 'le smt-true 'int ex ey))
           ((string=? name "equalsData")            (sort-bin 'eq smt-true 'data ex ey))
           ((string=? name "equalsByteString")      (sort-bin 'eq smt-true 'bytes ex ey))
+          ;; Data construction (symbolic on both): constrData tag fields (ex=tag, ey=fields);
+          ;; mkCons h tl on a list-data (ex=head, ey=tail).
+          ((string=? name "constrData")            (constr-data-op ex ey))
+          ((string=? name "mkCons")                (cons-data-op ex ey))
           ;; BLS12-381 binary / mixed (operand1 = ex = 1st UPLC arg, operand2 = ey)
           ((string=? name "bls12_381_G1_add")         (bls-bin-build 'g1-add ex ey))
           ((string=? name "bls12_381_G2_add")         (bls-bin-build 'g2-add ex ey))
@@ -441,10 +460,22 @@
   (define current-concrete-builtin
     (make-parameter (lambda (name rev-consts) #f)))
 
-  ;; Evaluate a saturated builtin symbolically: pass-through, then the symbolic
-  ;; table, then the concrete fold.  Mirrors symEvalBuiltin.
+  ;; `mkNilData ()` -> a *symbolic* empty `list data` (so it composes with the
+  ;; symbolic `mkCons`).  Its own stage (not pass-through/smtBuiltin) because its
+  ;; argument is the concrete `sConst Unit`, not an `sCon`.  Mirrors `symNil`.
+  ;; (`mkNilPairData` -> empty (list (pair data data)) is the map path: deferred.)
+  (define (sym-nil b args)
+    (and (string=? (builtin-name b) "mkNilData")
+         (fx=? (length args) 1)
+         (let ((a (car args)))
+           (and (eq? (sym-vtag a) 'sconst) (eq? (car (sconst-c a)) 'unit)
+                (sout (sval-con (smt-nil 'data)) smt-true)))))
+
+  ;; Evaluate a saturated builtin symbolically: the mkNilData stage, then
+  ;; pass-through, then the symbolic table, then the concrete fold.  Mirrors symEvalBuiltin.
   (define (sym-eval-builtin b args)
-    (or (sym-builtin-passthrough b args)
+    (or (sym-nil b args)
+        (sym-builtin-passthrough b args)
         (sym-builtin-symbolic b args)
         (and (not (passthrough-builtin? (builtin-name b)))
              (let ((consts (sym-concrete args)))

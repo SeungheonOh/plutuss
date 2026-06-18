@@ -170,7 +170,10 @@ the sound failure mode, never a wrong answer): integer arithmetic and
 comparison; `ifThenElse` (concrete or symbolic-boolean control flow, the latter
 compiled to an SMT `ite`); `trace`/`chooseUnit`, and `chooseData`/`chooseList`/
 `mkCons` on concrete operands (pass-through); the `Data` injections/projections
-(`iData`/`bData`/`unIData`/`unBData`/`unConstrData`/`unListData`),
+(`iData`/`bData`/`unIData`/`unBData`/`unConstrData`/`unListData`) **and symbolic
+`Data` construction** (`constrData` — symbolic on both tag *and* fields —
+`listData`, and `mkCons`/`mkNilData` over a `list data`, so `Data` is built from
+symbolic variables and round-tripped through z3's datatype axioms),
 `fstPair`/`sndPair`, `headList`/`tailList`/`nullList`, `lengthOfByteString`,
 `equalsData`/`equalsByteString`; and the cryptographic hashes (`sha2_256`,
 `sha3_256`, `blake2b_256`, `blake2b_224`, `keccak_256`, `ripemd_160`),

@@ -41,6 +41,7 @@
    smt-var smt-int smt-bool smt-neg smt-not smt-bin smt-uop smt-ite
    smt-mkpair smt-fst smt-snd smt-nil smt-cons smt-head smt-tail smt-null
    smt-verify-sig smt-bls-bin smt-bls-operand-sorts smt-bls-result-sort
+   smt-mk-constr-d
    ;; smart constructors / helpers
    smt-true smt-false smt-and smt-or smt-eq smt-imp smt-ne-zero smt-conj
    ;; introspection
@@ -90,6 +91,9 @@
   ;; g2-scalar-mul).  Mirror moist's `verifySig` / `blsBin`.
   (define (smt-verify-sig kind pk msg sig) (vector 'verifysig kind pk msg sig))
   (define (smt-bls-bin op a b)             (vector 'blsbin op a b))
+  ;; Data construction: `mkConstrD tag fields` (int x (list data) -> data), rendering
+  ;; to the `Data` datatype constructor `mkConstr`.  (`mkDList`/`mkMap` are UnOps.)
+  (define (smt-mk-constr-d tag fields)     (vector 'mkconstrd tag fields))
 
   ;; BLS binary op metadata (mirrors BlsBinOp.operandSorts / .resultSort).
   (define (smt-bls-operand-sorts op)
@@ -142,6 +146,9 @@
       ((dargs) (cons 'data (list 'list 'data)))
       ((ditems) (cons 'data (list 'list 'data)))
       ((dentries) (cons 'data (list 'list (list 'pair 'data 'data))))
+      ;; structured -> Data constructors (`listData`/`mapData`)
+      ((mk-dlist) (cons (list 'list 'data) 'data))
+      ((mk-map) (cons (list 'list (list 'pair 'data 'data)) 'data))
       ;; cryptographic hashes (bytes -> bytes), axiomatized as uninterpreted fns
       ((sha2-256 sha3-256 blake2b-256 blake2b-224 keccak-256 ripemd-160) (cons 'bytes 'bytes))
       ((serialise-data) (cons 'data 'bytes))            ; data -> bytes (CBOR), axiomatized
@@ -180,6 +187,8 @@
          (and (sort-list? sa) (smt-sort=? s (cadr sa)) s)))
       ((taill a) (let ((sa (smt-sort-of a))) (and (sort-list? sa) sa)))
       ((nulll a) (let ((sa (smt-sort-of a))) (and (sort-list? sa) 'bool)))
+      ((mkconstrd t f)
+       (and (eq? (smt-sort-of t) 'int) (equal? (smt-sort-of f) (list 'list 'data)) 'data))
       ((verifysig _ a b c)
        (and (eq? (smt-sort-of a) 'bytes) (eq? (smt-sort-of b) 'bytes)
             (eq? (smt-sort-of c) 'bytes) 'bool))
@@ -225,6 +234,8 @@
       ((dargs) (string-append "(cArgs " s ")"))
       ((ditems) (string-append "(lItems " s ")"))
       ((dentries) (string-append "(mEntries " s ")"))
+      ((mk-dlist) (string-append "(mkDList " s ")"))
+      ((mk-map) (string-append "(mkMap " s ")"))
       ((sha2-256) (string-append "(pl_sha2_256 " s ")"))
       ((sha3-256) (string-append "(pl_sha3_256 " s ")"))
       ((blake2b-256) (string-append "(pl_blake2b_256 " s ")"))
@@ -286,6 +297,7 @@
        (if (memq op '(g1-equal g2-equal final-verify))
            (string-append "(= " (smt->sexpr a) " " (smt->sexpr b) ")")
            (string-append "(" (bls-bin-name op) " " (smt->sexpr a) " " (smt->sexpr b) ")")))
+      ((mkconstrd t f) (string-append "(mkConstr " (smt->sexpr t) " " (smt->sexpr f) ")"))
       (else (error 'smt "bad expr" e))))
 
   ;; Collect (name . sort) of free variables, de-duplicated, first-seen order.
@@ -299,7 +311,7 @@
           ((fstp a) (go a)) ((sndp a) (go a)) ((headl _ a) (go a))
           ((taill a) (go a)) ((nulll a) (go a))
           ((bin _ a b) (go a) (go b)) ((mkpair a b) (go a) (go b)) ((consl a b) (go a) (go b))
-          ((blsbin _ a b) (go a) (go b))
+          ((blsbin _ a b) (go a) (go b)) ((mkconstrd a b) (go a) (go b))
           ((ite a b c) (go a) (go b) (go c))
           ((verifysig _ a b c) (go a) (go b) (go c))
           (else (error 'smt "bad expr in collect-vars" e))))
