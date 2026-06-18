@@ -23,8 +23,14 @@
 ;;; scrutinee, an unsupported builtin — returns #f (refuse), never a wrong answer.
 ;;; The supported first-order fragment is:
 ;;;   * integer arithmetic/comparison; equalsData/equalsByteString; lengthOfByteString;
+;;;   * constant LITERALS are first-order: Integer/Bool/ByteString and Data / `(list data)`
+;;;     literals compile to `sCon` SMT terms (litI/litB/litBS / dataToExpr), so they
+;;;     compose with the symbolic builtins (e.g. equalsByteString (sha2_256 x) #ab,
+;;;     mkCons (iData x) (con (list data) []));
 ;;;   * ifThenElse (concrete or symbolic-boolean control flow); trace/chooseUnit
-;;;     (pass-through); chooseData/chooseList/mkCons on concrete operands;
+;;;     (pass-through); chooseData/chooseList/mkCons on concrete operands (but a now
+;;;     first-order data/`(list data)` literal makes chooseData/chooseList refuse —
+;;;     mkCons on data instead composes symbolically);
 ;;;   * Data injections/projections: iData/bData/unIData/unBData/unConstrData/unListData;
 ;;;     Data *construction* (symbolic): constrData (symbolic tag AND fields), listData,
 ;;;     mkCons / mkNilData on a `list data` (so Data is built from symbolic vars and
@@ -148,17 +154,48 @@
        (else #f))))
 
   ;;; ======================================================================
-  ;;; Constants.  A UPLC constant is (type . value).  Integer/Bool become an
-  ;;; arithmetic-capable `scon`; everything else is carried concretely as
-  ;;; `sconst`.  Mirrors `constToSym`.
+  ;;; Constants.  A UPLC constant is (type . value).  Integer/Bool/ByteString and
+  ;;; Data / `(list data)` literals become first-order arithmetic/bytes/data `scon`
+  ;;; SMT terms (so literals compose with the symbolic builtins — e.g.
+  ;;; `mkCons (iData x) (con (list data) [])`, `equalsByteString (sha2_256 x) (con
+  ;;; bytestring …)`); every other constant type is carried concretely as `sconst`.
+  ;;; Mirrors `constToSym` / `dataToExpr`.
   ;;; ======================================================================
-  (define (const->smt c)
+  (define (const->smt c)        ; the arithmetic-capable subset (kept for callers)
     (case (car c)
       ((integer) (smt-int (cdr c)))
       ((bool) (smt-bool (cdr c)))
       (else #f)))
+
+  ;; Translate a concrete Plutus Data value into the SMT Data term that denotes it
+  ;; (the constructor counterpart of unConstrData/dArgs/…), so a `con data …`
+  ;; literal is a first-order `scon`.  Plutus Data: (I n)/(B bv)/(Constr t fs)/
+  ;; (List ds)/(Map entries) where entries are (k . v) pairs.  Mirrors dataToExpr.
+  (define (data->expr d)
+    (case (car d)
+      ((I) (smt-uop 'idata (smt-int (cadr d))))
+      ((B) (smt-uop 'bdata (smt-lit-bs (cadr d))))
+      ((Constr) (smt-mk-constr-d (smt-int (cadr d)) (data-list->expr (caddr d))))
+      ((List) (smt-uop 'mk-dlist (data-list->expr (cadr d))))
+      ((Map) (smt-uop 'mk-map (data-pair-list->expr (cadr d))))
+      (else (error 'compile "bad Data literal" d))))
+  (define (data-list->expr ds)
+    (if (null? ds) (smt-nil 'data)
+        (smt-cons (data->expr (car ds)) (data-list->expr (cdr ds)))))
+  (define (data-pair-list->expr ps)
+    (if (null? ps) (smt-nil (smt-sort-pair 'data 'data))
+        (smt-cons (smt-mkpair (data->expr (caar ps)) (data->expr (cdar ps)))
+                  (data-pair-list->expr (cdr ps)))))
+
   (define (const->sym c)
-    (let ((e (const->smt c))) (if e (sval-con e) (sval-const c))))
+    (let ((ty (car c)) (v (cdr c)))
+      (cond
+       ((eq? ty 'integer)    (sval-con (smt-int v)))
+       ((eq? ty 'bool)       (sval-con (smt-bool v)))
+       ((eq? ty 'bytestring) (sval-con (smt-lit-bs v)))
+       ((eq? ty 'data)       (sval-con (data->expr v)))
+       ((equal? ty (smt-sort-list 'data)) (sval-con (data-list->expr v)))  ; (con (list data) [...])
+       (else (sval-const c)))))
 
   ;; constant builders (type . value), matching the (plutuss) constant rep.
   (define (c-integer n) (cons 'integer n))
@@ -376,6 +413,11 @@
   ;;   trace s v = v ; chooseUnit u v = v  (the discriminant must be concrete).
   ;;   chooseData / chooseList: dispatch on a *concrete* Data variant / list-empty.
   ;;   mkCons x xs: cons a concrete element onto a concrete list.
+  ;; NOTE: these discriminants must be `sConst`.  Since `const->sym` now lifts
+  ;; `data` / `(list data)` literals to first-order `sCon` (so they compose with the
+  ;; symbolic builtins), `chooseData`/`chooseList` on a `data`/`(list data)` literal
+  ;; no longer match here and are refused — faithful to moist (its passthroughs are
+  ;; unchanged).  `mkCons` on `data` goes through `cons-data-op` (smtBuiltin) instead.
   (define (sym-builtin-passthrough b args)
     (let ((name (builtin-name b)))
       (cond

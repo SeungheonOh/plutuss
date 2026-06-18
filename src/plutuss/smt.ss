@@ -38,7 +38,7 @@
    smt-sort-int smt-sort-bool smt-sort-data smt-sort-bytes
    smt-sort-list smt-sort-pair smt-sort=?
    ;; expression constructors
-   smt-var smt-int smt-bool smt-neg smt-not smt-bin smt-uop smt-ite
+   smt-var smt-int smt-bool smt-lit-bs smt-neg smt-not smt-bin smt-uop smt-ite
    smt-mkpair smt-fst smt-snd smt-nil smt-cons smt-head smt-tail smt-null
    smt-verify-sig smt-bls-bin smt-bls-operand-sorts smt-bls-result-sort
    smt-mk-constr-d
@@ -72,6 +72,7 @@
   (define (smt-var name sort) (vector 'var name sort))
   (define (smt-int n)         (vector 'lit-i n))
   (define (smt-bool b)        (vector 'lit-b b))
+  (define (smt-lit-bs bv)     (vector 'lit-bs bv))   ; a ByteString literal (bytevector)
   (define (smt-neg e)         (vector 'neg e))
   (define (smt-not e)         (vector 'bnot e))
   (define (smt-bin op a b)    (vector 'bin op a b))
@@ -162,6 +163,7 @@
       ((var _ s) s)
       ((lit-i _) 'int)
       ((lit-b _) 'bool)
+      ((lit-bs _) 'bytes)
       ((neg a) (and (eq? (smt-sort-of a) 'int) 'int))
       ((bnot a) (and (eq? (smt-sort-of a) 'bool) 'bool))
       ((bin op a b)
@@ -268,11 +270,29 @@
       ((ed25519) "pl_verifyEd25519") ((ecdsa) "pl_verifyEcdsa") ((schnorr) "pl_verifySchnorr")
       (else (error 'smt "bad verify kind" kind))))
 
+  ;; A ByteString literal as an SMT-LIB String: each byte as the escape `\u{HH}`
+  ;; (an injective code-point map, no quoting hazards), matching the bytes=String
+  ;; model (str.len = byte count, = is byte equality).  Mirrors moist's litBS render.
+  (define hex-chars "0123456789abcdef")
+  (define (byte->smt-escape n)
+    (string-append "\\u{"
+                   (string (string-ref hex-chars (fxand (fxsrl n 4) 15))
+                           (string-ref hex-chars (fxand n 15)))
+                   "}"))
+  (define (bytes->smt-string bv)
+    (let ((out (open-output-string)))
+      (write-char #\" out)
+      (do ((i 0 (fx+ i 1))) ((fx>=? i (bytevector-length bv)))
+        (write-string (byte->smt-escape (bytevector-u8-ref bv i)) out))
+      (write-char #\" out)
+      (get-output-string out)))
+
   (define (smt->sexpr e)
     (match e
       ((var x _) x)
       ((lit-i n) (if (< n 0) (string-append "(- " (number->string (- n)) ")") (number->string n)))
       ((lit-b b) (if b "true" "false"))
+      ((lit-bs b) (bytes->smt-string b))
       ((neg a) (string-append "(- " (smt->sexpr a) ")"))
       ((bnot a) (string-append "(not " (smt->sexpr a) ")"))
       ((bin op a b) (string-append "(" (bin-head op) " " (smt->sexpr a) " " (smt->sexpr b) ")"))
@@ -306,7 +326,7 @@
       (let go ((e e))
         (match e
           ((var x s) (unless (member x seen) (set! seen (cons x seen)) (set! acc (cons (cons x s) acc))))
-          ((lit-i _) #t) ((lit-b _) #t) ((nill _) #t)
+          ((lit-i _) #t) ((lit-b _) #t) ((lit-bs _) #t) ((nill _) #t)
           ((neg a) (go a)) ((bnot a) (go a)) ((uop _ a) (go a))
           ((fstp a) (go a)) ((sndp a) (go a)) ((headl _ a) (go a))
           ((taill a) (go a)) ((nulll a) (go a))

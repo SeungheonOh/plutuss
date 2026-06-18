@@ -167,9 +167,15 @@ compile to nested SMT `ite`s), and refuting a false claim with a counterexample.
 
 **Supported first-order fragment** (everything else is *refused* — returns `#f`,
 the sound failure mode, never a wrong answer): integer arithmetic and
-comparison; `ifThenElse` (concrete or symbolic-boolean control flow, the latter
-compiled to an SMT `ite`); `trace`/`chooseUnit`, and `chooseData`/`chooseList`/
-`mkCons` on concrete operands (pass-through); the `Data` injections/projections
+comparison; constant **literals** are first-order — `Integer`/`Bool`/`ByteString`
+and `Data` / `(list data)` literals compile to `sCon` SMT terms, so a literal
+composes with the symbolic builtins (`equalsByteString (sha2_256 x) (con
+bytestring #ab)`, `mkCons (iData x) (con (list data) [])`, …); `ifThenElse`
+(concrete or symbolic-boolean control flow, the latter compiled to an SMT
+`ite`); `trace`/`chooseUnit`, and `chooseData`/`chooseList`/`mkCons` on concrete
+operands (pass-through; a now first-order `data`/`(list data)` literal makes
+`chooseData`/`chooseList` refuse, while `mkCons` on `data` composes via `consL`);
+the `Data` injections/projections
 (`iData`/`bData`/`unIData`/`unBData`/`unConstrData`/`unListData`) **and symbolic
 `Data` construction** (`constrData` — symbolic on both tag *and* fields —
 `listData`, and `mkCons`/`mkNilData` over a `list data`, so `Data` is built from
