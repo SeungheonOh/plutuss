@@ -262,19 +262,19 @@ return uplc node that handles according to the handlers.
                                          #'(ubinder (... ...)) #'(fieldname (... ...))))])
                                  (list ctor-idx (let loop ([is (iota (length ctor-fields))] [bs bwi])
                                           (cond
-                                           [(or (null? is) (null? bs))
+                                           [(null? is)
                                             (with-syntax ([(corres (... ...))
                                                            (map (lambda (x) #`(uplc #,(car x))) bwi)])
                                               #',(let ([binder corres] (... ...))
                                                    (uplc body))
                                               )
                                             ]
-                                           [(= (car is) (cadar bs))
-                                            #`(lam #,(caar bs) #,(loop (cdr is) (cdr bs)))]
-                                           [else
+                                           [(null? bs)
                                             #`(lam
                                                unused
-                                               #,(loop (cdr is) bs))])
+                                               #,(loop (cdr is) bs))]
+                                           [(= (car is) (cadar bs))
+                                            #`(lam #,(caar bs) #,(loop (cdr is) (cdr bs)))])
                                           ))
                                  ))]))
                         (syntax->list #'(handlers (... ...)))

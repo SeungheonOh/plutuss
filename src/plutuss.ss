@@ -9,6 +9,7 @@
           flat-encode-program flat-decode-program cbor-encode cbor-decode
           ;; syntax DSL (+ auxiliary keywords)
           uplc uplc-program uplc-eval uplc-run hex ->bytes
+          define-uplc-syntax
           lam con builtin constr I B List Map Constr
           integer bytestring bool unit data pair
           ;; budget + errors + misc

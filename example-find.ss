@@ -87,7 +87,7 @@
 ;; (define (lite c t e)
 ;;   (uplc (force ((force (builtin ifThenElse)) ,c (delay ,t) (delay ,e)))))
 
-(define (lite c t e)
+(define (lite c e t)
   (uplc (case ,c ,t ,e)))
   ;; (uplc (force ((force (builtin ifThenElse)) ,c (delay ,t) (delay ,e)))))
 
@@ -184,36 +184,118 @@
   (display (smt->smtlib (encode-property smt-true s))))
 (newline)
 
-;; (2)  forall x. find (== x) [x] == Just x.
-;; The predicate matches the first (and only) element: x == x, always true, so
-;; find returns Just x.  The success formula reduces to (ite (= x x) (= x x) false).
 (prove "(2)  forall x.  find (== x) [x] == Just x"
        (mkEnv ("x" int))
        (matchMaybe (,(find-of predEqX) ,(mkCons x ,(mkNil)))
-         (Nothing ()       (con bool #f))                    ; Nothing -> False
-         (Just ([v value]) ((builtin equalsInteger) ,v x)))  ; Just h -> h==x
+         (Nothing ()       (con bool #f))
+         (Just ([v value]) ((builtin equalsInteger) ,v x)))
        'unsat)
+;;  z3: unsat  (expected unsat)  OK
 
-;; (3)  forall a b x.  whatever  find (== x) [a, b]  returns, if it is a Just its
-;; payload equals x — the correctness of searching with the predicate (== x),
-;; over a concrete spine with fully symbolic elements and a symbolic predicate.
-;; Compiles to nested ites:  (ite (= a x) (= a x) (ite (= b x) (= b x) true)).
 (prove "(3)  forall a b x.  find (== x) [a,b] is Just h  =>  h == x"
        (mkEnv ("a" int) ("b" int) ("x" int))
        (matchMaybe (,(find-of predEqX) ,(mkCons a ,(mkCons b ,(mkNil))))
-         (Nothing ()       (con bool #t))                    ; Nothing -> True
-         (Just ([v value]) ((builtin equalsInteger) ,v x)))
+		   (Nothing ()       (con bool #t))
+		   (Just ([v value]) ((builtin equalsInteger) ,v x)))
        'unsat)
+;;  z3: unsat  (expected unsat)  OK
 
-;; (4)  NON-VACUITY: the tool genuinely refutes false claims.  "find (== x) [a]
-;; always returns a Just" is FALSE — when a /= x the element is skipped and find
-;; returns Nothing.  z3 reports sat and hands back a counterexample (a /= x).
 (prove "(4)  forall a x.  find (== x) [a] is always Just     (FALSE)"
        (mkEnv ("a" int) ("x" int))
        (matchMaybe (,(find-of predEqX) ,(mkCons a ,(mkNil)))
-         (Nothing ()       (con bool #f))      ; Nothing -> False (claim: impossible)
-         (Just ([v value]) (con bool #t)))     ; Just _  -> True
+		   (Nothing ()       (con bool #f)) ; Nothing -> False (claim: impossible)
+		   (Just ([v value]) (con bool #t))) ; Just _  -> True
        'sat)
+
+(prove "(4)  forall a x.  find (== x) [a] is always Just     (FALSE)"
+       (mkEnv)
+       (uplc (case (con bool #t) (con bool #f) (con bool #t)))
+       'unsat)
+
+(define-syntax pand
+  (syntax-rules ()
+    [(_ x y) (uplc (case x (con bool #f) y))]))
+
+(uplc-pretty (uplc ,(pand (con bool #f) (con bool #f))))
+(pand (con bool #f) (con bool #f))
+
+(define-plutus-type-Data Optional (None) (Some value))
+
+(define genMaybe
+  (lambda ()
+    (let ([i (symbol->string (gensym))]
+	  [j (symbol->string (gensym))])
+      (values
+       (uplc
+	(case ,(vector 'var i)
+	  ,mkNone
+	  ,(mkSome [(builtin iData),(vector 'var j)])
+	  ))
+       (mkEnv (i int) (j int))
+       (lambda (t)
+	 (uplc
+	  (case ,(pand
+		  [(builtin lessThanInteger) ,(vector 'var i) (con integer 2)]
+		  [(builtin lessThanEqualsInteger) (con integer 0) ,(vector 'var i)])
+	    (con bool #t)
+	    ,t
+	    )))
+       )
+      )))
+
+(let-values ([(t env p) (genMaybe)])
+  (uplc-pretty t)
+  (display env)
+  (printf "~%")
+  (uplc-pretty (p (uplc (con bool #t))))
+  (uplc-pretty (p (matchOptional
+	      ,t
+	      (None () (con bool #t))
+	      (Some () (con bool #t))
+	      )))
+  (prove "(genMaybe) guard restricts the partial int-tag Maybe to {0,1} => total => provable"
+	 (append env (mkEnv ("x" int)))
+	 (p (matchOptional
+	     ,t
+	     (None () (con bool #t))
+	     (Some () (con bool #t))
+	     ))
+	 'sat)
+  )
+
+
+(uplc-pretty
+ (matchOptional
+  ,mkNone
+  (None () (con bool #t))
+  (Some () (con bool #t))
+  ))
+
+(uplc-pretty mkNone)
+
+(call-with-values genMaybe (lambda (t env p) (uplc-pretty t)))
+
+(uplc-pretty (mkNothing)
+	     )
+
+(genMaybe)
+
+;;  z3: sat  (expected sat)  OK
+;; counterexample:
+;;   (
+;;     (define-fun a () Int
+;;       1)
+;;     (define-fun x () Int
+;;       0))
+
+(prove "(3)  forall a b.  "
+       (mkEnv ("a" bytes) ("b" bytes))
+       (uplc (case [(builtin equalsByteString) a b]
+	       (con bool #t)
+	       [(builtin equalsByteString) [(builtin sha2_256) a] [(builtin sha2_256) b]]
+	       ))
+       'unsat)
+
 
 (rule)
 (display "(1)(2)(3) unsat => proved for ALL inputs;  (4) sat => counterexample found\n")

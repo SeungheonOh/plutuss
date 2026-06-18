@@ -40,6 +40,7 @@
 
 (library (plutuss dsl)
   (export uplc uplc-program uplc-pretty uplc-eval uplc-run hex ->bytes
+          define-uplc-syntax
           ;; auxiliary keywords (so syntax-rules literals match at the use site;
           ;; delay/force/case/error/list/string and unquote/unquote-splicing
           ;; match via (chezscheme); pair is bound nowhere else, so it must be
@@ -118,6 +119,28 @@
 ;; No-rules marker: expanding (uplc ,@e) outside a list position is an error.
 (define-syntax uplc-unquote-splicing-outside-list (syntax-rules ()))
 
+;; ---- user-extensible head keywords ----------------------------------------
+;; A macro defined with `define-uplc-syntax` is recognized by `uplc` in operator
+;; position and expanded there, so (uplc (pand a b)) expands `pand` instead of
+;; reading it as a variable application.  A head identifier is ambiguous — it
+;; could be a user macro OR a UPLC variable being applied, e.g. f in
+;; (lam f (f x)) — so we disambiguate with Chez's compile-time property lookup:
+;; only identifiers carrying the %uplc-keyword property are treated as macros;
+;; everything else (variables, builtins, lambdas, nested apps) is application.
+(define-syntax %uplc-keyword (syntax-rules ()))
+
+(define-syntax uplc-app-or-macro
+  (lambda (stx)
+    (lambda (lookup)
+      (syntax-case stx ()
+        ;; head is a marked uplc-macro: expand (f a ...); a uplc-macro expands to
+        ;; a (uplc ...) term, so this drops straight back into the term grammar.
+        ((_ f a ...) (and (identifier? #'f) (lookup #'f #'%uplc-keyword))
+         #'(f a ...))
+        ;; otherwise: ordinary left-associated application spine (unchanged).
+        ((_ f a ...)
+         #'(uplc-app (uplc f) (a ...)))))))
+
 ;; PlutusData builder.
 (define-syntax up-data
   (syntax-rules (I B List Map Constr unquote)
@@ -181,8 +204,21 @@
     ((_ (error))          (vector 'uerror))
     ((_ (constr tag f ...)) (vector 'constr (unq tag) (uplc-list (f ...))))
     ((_ (case s b ...))   (vector 'case (uplc s) (uplc-list (b ...))))
-    ((_ (f a as ...))     (uplc-app (uplc f) (a as ...)))  ; left-assoc application
+    ((_ (f a as ...))     (uplc-app-or-macro f a as ...))  ; head may be a uplc-macro
     ((_ x)                (vector 'var (symbol->string 'x)))))
+
+;; Define a user macro usable as a head keyword inside `uplc`.  `template` is
+;; ordinary uplc surface syntax; the macro expands to a (uplc template) term and
+;; is marked so `uplc` expands it in operator position.  It is equally usable
+;; standalone (it returns a term) or spliced with `,`.
+;;   (define-uplc-syntax (pand x y) (case x y (con bool #f)))
+;;   (uplc (pand (con bool #t) (con bool #f)))     ; pand expands in place
+(define-syntax define-uplc-syntax
+  (syntax-rules ()
+    ((_ (name . pat) template)
+     (begin
+       (define-syntax name (syntax-rules () ((_ . pat) (uplc template))))
+       (define-property name %uplc-keyword #t)))))
 
 (define-syntax uplc-program
   (syntax-rules ()
