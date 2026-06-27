@@ -1,214 +1,352 @@
-;;; (plutuss compile) — a denotational UPLC -> SMT compiler.
+;;; (plutuss compile) -- UPLC -> SMT symbolic compiler.
 ;;;
-;;; This is a symbolic CEK evaluator: it runs the very same machine as
-;;; (plutuss machine), but over a *symbolic* value domain in which a constant is
-;;; an `smt` expression (from (plutuss smt)) rather than a concrete datum.  A
-;;; symbolic integer/boolean input is a free SMT variable, so evaluating a term
-;;; with symbolic inputs yields an `smt` expression denoting the term's result
-;;; as a function of those inputs — together with a *definedness* guard that is
-;;; true exactly at inputs for which the concrete CEK evaluation would not error.
+;;; This is a Scheme port of the current Moist.SMT.UPLC evaluator.  Symbolic
+;;; evaluation returns a list of guarded outcomes:
 ;;;
-;;; It is a faithful Scheme port of the verified Lean development
-;;; `Moist/Compile/{SymValue,Builtins,Compile}.lean` (utxo-company/moist).  The
-;;; five mutually-recursive functions (sym-eval/sym-apply/sym-force/
-;;; sym-eval-list/sym-apply-list, plus sym-case) mirror the machine's
-;;; compute/return/force/apply transitions one-for-one, defunctionalized exactly
-;;; as the CEK does (closures are applied by the evaluator, never reified into
-;;; SMT).  Bounded recursion is handled by `fuel`: when fuel runs out the result
-;;; is a sound *refusal* (#f) or, on a symbolic branch, a `defined = false` leaf
-;;; — never a silent under-approximation.
+;;;   (ok pc value) | (error pc) | (timeout pc)
 ;;;
-;;; Soundness posture (R1): every construct the symbolic domain cannot represent
-;;; first-order — a genuinely symbolic unsupported builtin, a closure case
-;;; scrutinee, an unsupported builtin — returns #f (refuse), never a wrong answer.
-;;; The supported first-order fragment is:
-;;;   * integer arithmetic/comparison; equalsData/equalsByteString; lengthOfByteString;
-;;;   * constant LITERALS are first-order: Integer/Bool/ByteString and Data / `(list data)`
-;;;     literals compile to `sCon` SMT terms (litI/litB/litBS / dataToExpr), so they
-;;;     compose with the symbolic builtins (e.g. equalsByteString (sha2_256 x) #ab,
-;;;     mkCons (iData x) (con (list data) []));
-;;;   * ifThenElse (concrete or symbolic-boolean control flow); trace/chooseUnit
-;;;     (pass-through); chooseData/chooseList/mkCons on concrete operands (but a now
-;;;     first-order data/`(list data)` literal makes chooseData/chooseList refuse —
-;;;     mkCons on data instead composes symbolically);
-;;;   * Data injections/projections: iData/bData/unIData/unBData/unConstrData/unListData;
-;;;     Data *construction* (symbolic): constrData (symbolic tag AND fields), listData,
-;;;     mkCons / mkNilData on a `list data` (so Data is built from symbolic vars and
-;;;     round-tripped); fstPair/sndPair; headList/tailList/nullList;
-;;;   * the cryptographic hashes (sha2_256/sha3_256/blake2b_256/blake2b_224/keccak_256/
-;;;     ripemd_160), serialiseData, BLS12-381 (G1/G2/pairing) ops, and the three
-;;;     signature-verification primitives — all axiomatized as uninterpreted SMT
-;;;     functions (z3 reasons about them abstractly: x=y -> f x = f y);
-;;;   * lambda/delay/force/apply, constr, and case — fully supported (defunctionalized).
-;;;     `case` dispatches not only on a `constr` value but on a builtin scrutinee:
-;;;     a builtin *constant* (Bool/Unit/Integer/list/pair) by sum-of-products, and a
-;;;     (possibly symbolic) Bool/Integer/list/pair `scon` by `ite`-combination.
-;;;
-;;; Builtins are identified by their UPLC name.  A `#(builtin desc)` node may
-;;; carry either a real (plutuss builtins) descriptor record (from the parser or
-;;; the `uplc` DSL) or, for FFI-free programmatic use, a plain string/symbol;
-;;; both are accepted.  Reading a descriptor's name/arity/forces uses Chez's
-;;; record reflection, so this library does NOT import (plutuss builtins) and
-;;; never triggers its native-crypto FFI — the first-order fragment it targets
-;;; needs none of those builtins.
+;;; A final SMT query asserts one or more conditions over those outcomes.
 (library (plutuss compile)
   (export
-   ;; symbolic value constructors / introspection
-   sym-vtag sval-con sval-const sval-lam sval-delay sval-constr sval-builtin sval-ite
-   sout sout-value sout-defined
-   ;; environment / inputs
-   empty-sym-env sym-env-extend sym-env-lookup make-sym-env
-   symbolic-input fresh-input
-   ;; the evaluator
-   sym-eval sym-apply sym-force extract encode-property
-   default-fuel
-   ;; high-level interface
-   compile-term compile-success compile-property
-   ;; concrete-fold hook (off by default; see notes)
-   current-concrete-builtin
-   ;; constant helpers
-   c-integer c-bool c-bytestring c-unit c-data const->sym
-   ;; builtin metadata
-   builtin-name builtin-arity builtin-forces builtin-spec)
+   ;; symbolic values
+   sv-const sv-dyn sv-fo sv-pair sv-lam sv-delay sv-constr sv-builtin sv-choice symv-tag
+   sc-integer sc-bytes sc-string sc-bool sc-unit sc-data sc-const-list
+   sc-data-list sc-pair-data-list sc-pair-data sc-array sc-g1 sc-g2 sc-ml
+   ;; outcomes and projections
+   outcome-tag outcome-pc outcome-val ok err timeout bind-out map-pc
+   encode-val? as-int as-bytes as-string as-bool as-data as-const-list
+   ;; compatibility helpers from the previous compiler API
+   symr symr-inc symr-err symr-val junk
+   merge-val sym-merge reify-fo reify-v reify-err
+   ;; constants / environment / builtins
+   const->sexpr data->sexpr const-literal sym-lookup
+   builtin-name builtin-spec expected-args
+   ;; evaluator
+   sym-eval eval-sym sym-apply apply-sym sym-force force-sym sym-case case-sym
+   eval-builtin-sym
+   ;; inputs and top-level driver
+   mk-input uplc-symbolic-compile default-fuel
+   compiled-result compiled-consts compiled-sides
+   ;; goal builders and scripts
+   okBoolTrueCond okBoolCond okIntEqCond okValEqCond errorCond timeoutCond
+   goal-equals-v goal-returns-bool goal-returns-int
+   goal-errors goal-succeeds goal-indeterminate
+   compiled->script compiled->smtlib)
   (import (chezscheme) (plutuss base) (plutuss smt))
 
-  ;;; ======================================================================
-  ;;; Symbolic values.  One-for-one with (plutuss machine)'s runtime values,
-  ;;; except a concrete constant `#(vcon c)` becomes either `#(scon e)` (an
-  ;;; arithmetic-capable `smt` expression) or `#(sconst c)` (any other constant,
-  ;;; carried concretely).  `#(site c a b)` is the deferred symbolic choice
-  ;;; produced by a symbolic-boolean ifThenElse (mirrors moist's `sIte`).
-  ;;; ======================================================================
-  (define (sval-con e)              (vector 'scon e))
-  (define (sval-const c)            (vector 'sconst c))
-  (define (sval-lam nm body env)    (vector 'slam nm body env))
-  (define (sval-delay body env)     (vector 'sdelay body env))
-  (define (sval-constr tag fields)  (vector 'sconstr tag fields))
-  (define (sval-builtin b f a n)    (vector 'sbuiltin b f a n))
-  (define (sval-ite cnd a b)        (vector 'site cnd a b))
+  ;;; ---- small list helpers ----------------------------------------------
+  (define (filter-map f xs)
+    (let loop ((xs xs) (acc '()))
+      (cond ((null? xs) (reverse acc))
+            ((f (car xs)) => (lambda (v) (loop (cdr xs) (cons v acc))))
+            (else (loop (cdr xs) acc)))))
+  (define (append-map f xs) (apply append (map f xs)))
+  (define (list-ref? xs i)
+    (cond ((null? xs) #f)
+          ((fx=? i 0) (car xs))
+          (else (list-ref? (cdr xs) (fx- i 1)))))
+  (define (enum-list xs)
+    (let loop ((i 0) (xs xs))
+      (if (null? xs) '() (cons (cons i (car xs)) (loop (fx+ i 1) (cdr xs))))))
 
-  (define (sym-vtag v) (vector-ref v 0))
-  (define (scon-e v)   (vector-ref v 1))
-  (define (sconst-c v) (vector-ref v 1))
-  (define (slam-body v) (vector-ref v 2))   (define (slam-env v) (vector-ref v 3))
-  (define (sdelay-body v) (vector-ref v 1)) (define (sdelay-env v) (vector-ref v 2))
-  (define (sconstr-tag v) (vector-ref v 1)) (define (sconstr-fields v) (vector-ref v 2))
-  (define (sbuiltin-fn v) (vector-ref v 1)) (define (sbuiltin-forces v) (vector-ref v 2))
-  (define (sbuiltin-args v) (vector-ref v 3)) (define (sbuiltin-nargs v) (vector-ref v 4))
-  (define (site-cond v) (vector-ref v 1)) (define (site-a v) (vector-ref v 2)) (define (site-b v) (vector-ref v 3))
+  ;;; ---- symbolic constants and values -----------------------------------
+  (define (sc-integer e)        (vector 'integer e))
+  (define (sc-bytes e)          (vector 'bytes e))
+  (define (sc-string e)         (vector 'string e))
+  (define (sc-bool e)           (vector 'bool e))
+  (define sc-unit               (vector 'unit))
+  (define (sc-data e)           (vector 'data e))
+  (define (sc-const-list e)     (vector 'constList e))
+  (define (sc-data-list e)      (vector 'dataList e))
+  (define (sc-pair-data-list e) (vector 'pairDataList e))
+  (define (sc-pair-data a b)    (vector 'pairData a b))
+  (define (sc-array e)          (vector 'array e))
+  (define (sc-g1 e)             (vector 'g1 e))
+  (define (sc-g2 e)             (vector 'g2 e))
+  (define (sc-ml e)             (vector 'ml e))
 
-  ;; A symbolic output: the value together with its definedness `smt` formula.
-  ;; `#f` is the `none`/refusal result; a valid output is `(cons value defined)`.
-  (define (sout value defined) (cons value defined))
-  (define (sout-value o) (car o))
-  (define (sout-defined o) (cdr o))
+  (define (sv-const c)          (vector 'const c))
+  (define (sv-dyn e)            (vector 'dyn e))
+  ;; Compatibility name: old compiler called a dynamic Val expression "fo".
+  (define sv-fo sv-dyn)
+  (define (sv-pair a b)         (vector 'pair a b))
+  (define (sv-lam body env)     (vector 'lam body env))
+  (define (sv-delay body env)   (vector 'delay body env))
+  (define (sv-constr tag fields)(vector 'constr tag fields))
+  (define (sv-builtin b args ea)(vector 'builtin b args ea))
+  (define (sv-choice c a b)     (vector 'choice c a b))
+  (define (symv-tag v)          (vector-ref v 0))
+  (define junk (sv-const sc-unit))
 
-  ;;; ======================================================================
-  ;;; Symbolic environment: a list with the same 1-based de-Bruijn convention
-  ;;; as (plutuss machine) (Var 1 = head).
-  ;;; ======================================================================
-  (define empty-sym-env '())
-  (define (sym-env-extend env v) (cons v env))
-  (define (sym-env-lookup env k)
+  ;;; ---- outcomes ---------------------------------------------------------
+  (define (out-ok pc v)       (vector 'ok pc v))
+  (define (out-error pc)      (vector 'error pc))
+  (define (out-timeout pc)    (vector 'timeout pc))
+  (define (outcome-tag o)     (vector-ref o 0))
+  (define (outcome-pc o)      (vector-ref o 1))
+  (define (outcome-val o)     (and (eq? (outcome-tag o) 'ok) (vector-ref o 2)))
+  (define (ok v)              (list (out-ok (s-bool #t) v)))
+  (define err                 (list (out-error (s-bool #t))))
+  (define timeout             (list (out-timeout (s-bool #t))))
+
+  (define (guard-out g o)
+    (case (outcome-tag o)
+      ((ok)      (out-ok (sAnd g (outcome-pc o)) (outcome-val o)))
+      ((error)   (out-error (sAnd g (outcome-pc o))))
+      ((timeout) (out-timeout (sAnd g (outcome-pc o))))
+      (else (error 'guard-out "bad outcome" o))))
+
+  (define (bind-out xs k)
+    (append-map
+     (lambda (o)
+       (case (outcome-tag o)
+         ((ok)      (map (lambda (o2) (guard-out (outcome-pc o) o2)) (k (outcome-val o))))
+         ((error)   (list o))
+         ((timeout) (list o))
+         (else (error 'bind-out "bad outcome" o))))
+     xs))
+  (define (map-pc g xs) (map (lambda (o) (guard-out g o)) xs))
+
+  ;;; Compatibility view: derive timeout/error conditions from guarded outcomes.
+  (define (symr inc err val) (vector 'symr inc err val))
+  (define (symr-inc r) (if (and (vector? r) (eq? (vector-ref r 0) 'symr))
+                           (vector-ref r 1)
+                           (timeoutCond r)))
+  (define (symr-err r) (if (and (vector? r) (eq? (vector-ref r 0) 'symr))
+                           (vector-ref r 2)
+                           (errorCond r)))
+  (define (symr-val r)
+    (if (and (vector? r) (eq? (vector-ref r 0) 'symr))
+        (vector-ref r 3)
+        (let loop ((os r))
+          (cond ((null? os) junk)
+                ((eq? (outcome-tag (car os)) 'ok) (outcome-val (car os)))
+                (else (loop (cdr os)))))))
+  (define (merge-val c x y) (sv-choice c x y))
+  (define (sym-merge c x y) (append (map-pc c x) (map-pc (sNot c) y)))
+
+  ;;; ---- Val/Data encodings ----------------------------------------------
+  (define (val-list-expr xs)
+    (if (null? xs) vl-nil (vl-cons (car xs) (val-list-expr (cdr xs)))))
+  (define (data-list-expr xs)
+    (if (null? xs) dl-nil (dl-cons (car xs) (data-list-expr (cdr xs)))))
+  (define (data-pair-list-expr xs)
+    (if (null? xs) dm-nil
+        (dm-cons (caar xs) (cdar xs) (data-pair-list-expr (cdr xs)))))
+
+  (define (data->sexpr d)
+    (case (car d)
+      ((Constr) (d-constr (s-int (cadr d)) (data-list-expr (map data->sexpr (caddr d)))))
+      ((Map)    (d-map (data-pair-list-expr
+                        (map (lambda (p) (cons (data->sexpr (car p)) (data->sexpr (cdr p))))
+                             (cadr d)))))
+      ((List)   (d-list (data-list-expr (map data->sexpr (cadr d)))))
+      ((I)      (d-i (s-int (cadr d))))
+      ((B)      (d-b (seq-of-bytes (cadr d))))
+      (else (error 'data->sexpr "bad Data" d))))
+
+  (define (pair-data-type? t)
+    (and (pair? t) (eq? (car t) 'pair) (eq? (cadr t) 'data) (eq? (caddr t) 'data)))
+
+  (define (const-list-expr et items)
+    (if (null? items) vl-nil
+        (vl-cons (const->sexpr (cons et (car items)))
+                 (const-list-expr et (cdr items)))))
+  (define (data-list-literal ds) (data-list-expr (map data->sexpr ds)))
+  (define (data-pair-list-literal ps)
+    (data-pair-list-expr
+     (map (lambda (p) (cons (data->sexpr (car p)) (data->sexpr (cdr p)))) ps)))
+
+  (define (const-literal c)
+    (let ((ty (car c)) (v (cdr c)))
+      (cond
+       ((eq? ty 'integer)    (sv-const (sc-integer (s-int v))))
+       ((eq? ty 'bytestring) (sv-const (sc-bytes (seq-of-bytes v))))
+       ((eq? ty 'string)     (sv-const (sc-string (s-str v))))
+       ((eq? ty 'unit)       (sv-const sc-unit))
+       ((eq? ty 'bool)       (sv-const (sc-bool (s-bool v))))
+       ((eq? ty 'data)       (sv-const (sc-data (data->sexpr v))))
+       ((and (pair? ty) (eq? (car ty) 'list))
+        (let ((et (cadr ty)))
+          (cond
+           ((eq? et 'data)       (sv-const (sc-data-list (data-list-literal v))))
+           ((pair-data-type? et) (sv-const (sc-pair-data-list (data-pair-list-literal v))))
+           (else                 (sv-const (sc-const-list (const-list-expr et v)))))))
+       ((and (pair? ty) (eq? (car ty) 'array))
+        (sv-const (sc-array (const-list-expr (cadr ty) v))))
+       ((and (pair? ty) (eq? (car ty) 'pair))
+        (let ((a (cadr ty)) (b (caddr ty)))
+          (if (and (eq? a 'data) (eq? b 'data))
+              (sv-const (sc-pair-data (data->sexpr (car v)) (data->sexpr (cdr v))))
+              (sv-pair (const-literal (cons a (car v)))
+                       (const-literal (cons b (cdr v)))))))
+       ((eq? ty 'g1) (sv-const (sc-g1 (s-atom "g1_default"))))
+       ((eq? ty 'g2) (sv-const (sc-g2 (s-atom "g2_default"))))
+       ((eq? ty 'ml) (sv-const (sc-ml (s-atom "ml_default"))))
+       (else (error 'const-literal "unsupported constant type" ty)))))
+
+  (define (encode-const? c)
+    (case (vector-ref c 0)
+      ((integer)       (v-int (vector-ref c 1)))
+      ((bytes)         (v-bs (vector-ref c 1)))
+      ((string)        (v-str (vector-ref c 1)))
+      ((bool)          (v-bool (vector-ref c 1)))
+      ((unit)          v-unit)
+      ((data)          (v-data (vector-ref c 1)))
+      ((constList)     (v-list (vector-ref c 1)))
+      ((dataList)      (v-dlist (vector-ref c 1)))
+      ((pairDataList)  (v-pdlist (vector-ref c 1)))
+      ((pairData)      (v-paird (vector-ref c 1) (vector-ref c 2)))
+      ((array)         (v-arr (vector-ref c 1)))
+      ((g1)            (v-g1 (vector-ref c 1)))
+      ((g2)            (v-g2 (vector-ref c 1)))
+      ((ml)            (v-ml (vector-ref c 1)))
+      (else #f)))
+
+  (define (encode-val? v)
+    (case (symv-tag v)
+      ((const) (encode-const? (vector-ref v 1)))
+      ((dyn)   (vector-ref v 1))
+      ((pair)
+       (let ((a (encode-val? (vector-ref v 1))) (b (encode-val? (vector-ref v 2))))
+         (and a b (v-pair a b))))
+      ((constr)
+       (let ((fs (encode-val-list? (vector-ref v 2))))
+         (and fs (v-constr (vector-ref v 1) (val-list-expr fs)))))
+      (else #f)))
+  (define (encode-val-list? vs)
+    (cond ((null? vs) '())
+          ((encode-val? (car vs)) =>
+           (lambda (v)
+             (let ((rest (encode-val-list? (cdr vs))))
+               (and rest (cons v rest)))))
+          (else #f)))
+
+  (define (const->sexpr c)
+    (or (encode-val? (const-literal c)) v-unit))
+  (define (reify-fo v)
+    (let ((e (encode-val? v)))
+      (if e (cons (s-bool #f) e) (cons (s-bool #t) v-unit))))
+  (define (reify-v v) (cdr (reify-fo v)))
+  (define (reify-err v) (car (reify-fo v)))
+
+  ;;; ---- projections ------------------------------------------------------
+  (define (proj guard val) (vector 'proj guard val))
+  (define (proj-guard p) (vector-ref p 1))
+  (define (proj-val p) (vector-ref p 2))
+  (define (proj-pure a) (proj (s-bool #t) a))
+  (define (proj-fail dummy) (proj (s-bool #f) dummy))
+  (define (proj-map f p) (proj (proj-guard p) (f (proj-val p))))
+  (define (proj-map2 f a b)
+    (proj (sAnd (proj-guard a) (proj-guard b)) (f (proj-val a) (proj-val b))))
+  (define (proj-map3 f a b c)
+    (proj (sAll (list (proj-guard a) (proj-guard b) (proj-guard c)))
+          (f (proj-val a) (proj-val b) (proj-val c))))
+
+  (define (value-proj ctor selector dummy v)
+    (case (symv-tag v)
+      ((dyn) (let ((e (vector-ref v 1))) (proj (v-is-con ctor e) (s-app selector (list e)))))
+      (else (proj-fail dummy))))
+
+  (define (as-int v)
+    (if (and (eq? (symv-tag v) 'const) (eq? (vector-ref (vector-ref v 1) 0) 'integer))
+        (proj-pure (vector-ref (vector-ref v 1) 1))
+        (value-proj "VInt" "unVInt" (s-int 0) v)))
+  (define (as-bytes v)
+    (if (and (eq? (symv-tag v) 'const) (eq? (vector-ref (vector-ref v 1) 0) 'bytes))
+        (proj-pure (vector-ref (vector-ref v 1) 1))
+        (value-proj "VBytes" "unVBytes" seq-empty v)))
+  (define (as-string v)
+    (if (and (eq? (symv-tag v) 'const) (eq? (vector-ref (vector-ref v 1) 0) 'string))
+        (proj-pure (vector-ref (vector-ref v 1) 1))
+        (value-proj "VString" "unVString" (s-str "") v)))
+  (define (as-bool v)
+    (if (and (eq? (symv-tag v) 'const) (eq? (vector-ref (vector-ref v 1) 0) 'bool))
+        (proj-pure (vector-ref (vector-ref v 1) 1))
+        (value-proj "VBool" "unVBool" (s-bool #f) v)))
+  (define (as-data v)
+    (if (and (eq? (symv-tag v) 'const) (eq? (vector-ref (vector-ref v 1) 0) 'data))
+        (proj-pure (vector-ref (vector-ref v 1) 1))
+        (value-proj "VData" "unVData" (d-i (s-int 0)) v)))
+  (define (as-data-list v)
+    (cond
+     ((and (eq? (symv-tag v) 'const) (eq? (vector-ref (vector-ref v 1) 0) 'dataList))
+      (proj-pure (vector-ref (vector-ref v 1) 1)))
+     ((and (eq? (symv-tag v) 'const) (eq? (vector-ref (vector-ref v 1) 0) 'constList))
+      (proj-fail dl-nil))
+     (else (value-proj "VDataList" "unVDataList" dl-nil v))))
+  (define (as-pair-data-list v)
+    (if (and (eq? (symv-tag v) 'const) (eq? (vector-ref (vector-ref v 1) 0) 'pairDataList))
+        (proj-pure (vector-ref (vector-ref v 1) 1))
+        (value-proj "VPairDataList" "unVPairDataList" dm-nil v)))
+  (define (as-const-list v)
+    (if (and (eq? (symv-tag v) 'const) (eq? (vector-ref (vector-ref v 1) 0) 'constList))
+        (proj-pure (vector-ref (vector-ref v 1) 1))
+        (value-proj "VList" "unVList" vl-nil v)))
+  (define (as-array v)
+    (if (and (eq? (symv-tag v) 'const) (eq? (vector-ref (vector-ref v 1) 0) 'array))
+        (proj-pure (vector-ref (vector-ref v 1) 1))
+        (value-proj "VArray" "unVArray" vl-nil v)))
+  (define (as-g1 v)
+    (if (and (eq? (symv-tag v) 'const) (eq? (vector-ref (vector-ref v 1) 0) 'g1))
+        (proj-pure (vector-ref (vector-ref v 1) 1))
+        (value-proj "VG1" "unVG1" (s-atom "g1_default") v)))
+  (define (as-g2 v)
+    (if (and (eq? (symv-tag v) 'const) (eq? (vector-ref (vector-ref v 1) 0) 'g2))
+        (proj-pure (vector-ref (vector-ref v 1) 1))
+        (value-proj "VG2" "unVG2" (s-atom "g2_default") v)))
+  (define (as-ml v)
+    (if (and (eq? (symv-tag v) 'const) (eq? (vector-ref (vector-ref v 1) 0) 'ml))
+        (proj-pure (vector-ref (vector-ref v 1) 1))
+        (value-proj "VMlResult" "unVMlResult" (s-atom "ml_default") v)))
+  (define (as-pair-data v)
+    (cond
+     ((and (eq? (symv-tag v) 'const) (eq? (vector-ref (vector-ref v 1) 0) 'pairData))
+      (proj-pure (cons (vector-ref (vector-ref v 1) 1) (vector-ref (vector-ref v 1) 2))))
+     ((eq? (symv-tag v) 'dyn)
+      (let ((e (vector-ref v 1))) (proj (v-is-con "VPairData" e) (cons (v-fst-d e) (v-snd-d e)))))
+     (else (proj-fail (cons (d-i (s-int 0)) (d-i (s-int 0)))))))
+  (define (as-pair v)
+    (cond
+     ((eq? (symv-tag v) 'pair) (proj-pure (cons (vector-ref v 1) (vector-ref v 2))))
+     ((eq? (symv-tag v) 'dyn)
+      (let ((e (vector-ref v 1))) (proj (v-is-con "VPair" e) (cons (sv-dyn (v-fst e)) (sv-dyn (v-snd e))))))
+     (else (proj-fail (cons junk junk)))))
+  (define (as-const-val v)
+    (case (symv-tag v)
+      ((const)
+       (let ((e (encode-val? v))) (if e (proj-pure e) (proj-fail v-unit))))
+      ((dyn)
+       (let ((e (vector-ref v 1))) (proj (s-app "const_val_valid" (list e)) e)))
+      ((pair)
+       (let ((a (as-const-val (vector-ref v 1))) (b (as-const-val (vector-ref v 2))))
+         (proj (sAnd (proj-guard a) (proj-guard b)) (v-pair (proj-val a) (proj-val b)))))
+      (else (proj-fail v-unit))))
+
+  (define (unit-guard v)
+    (cond
+     ((and (eq? (symv-tag v) 'const) (eq? (vector-ref (vector-ref v 1) 0) 'unit)) (s-bool #t))
+     ((eq? (symv-tag v) 'dyn) (v-is-con "VUnit" (vector-ref v 1)))
+     (else (s-bool #f))))
+
+  (define (checked1 p mk)
+    (list (out-ok (proj-guard p) (mk (proj-val p)))
+          (out-error (sNot (proj-guard p)))))
+  (define (checked-bool p) (checked1 p (lambda (b) (sv-const (sc-bool b)))))
+  (define (checked-const p mk) (checked1 p (lambda (e) (sv-const (mk e)))))
+  (define (checked2 p mk)
+    (append (map (lambda (o) (guard-out (proj-guard p) o)) (mk (proj-val p)))
+            (list (out-error (sNot (proj-guard p))))))
+
+  ;;; ---- environment and builtin metadata --------------------------------
+  (define (sym-lookup env k)
     (cond ((null? env) #f)
           ((fx=? k 0) #f)
           ((fx=? k 1) (car env))
-          (else (sym-env-lookup (cdr env) (fx- k 1)))))
-  ;; Build an env from inputs given innermost-first (so the first listed is Var 1).
-  (define (make-sym-env . inputs) inputs)
+          (else (sym-lookup (cdr env) (fx- k 1)))))
+  (define lookup-env sym-lookup)
+  (define (extend-env rho v) (cons v rho))
 
-  ;; A symbolic input of the given sort, bound to a fresh SMT variable `name`.
-  (define (symbolic-input name sort)
-    (sval-con (smt-var (if (symbol? name) (symbol->string name) name) sort)))
-  ;; Counter-free fresh inputs: caller supplies distinct names.
-  (define (fresh-input name sort) (symbolic-input name sort))
-
-  (define (nth? lst n)
-    (cond ((null? lst) #f)
-          ((fx=? n 0) (car lst))
-          (else (nth? (cdr lst) (fx- n 1)))))
-
-  (define (sort-pair? s) (and (pair? s) (eq? (car s) 'pair)))
-
-  ;; Symbolic analogue of the machine's `case-on-constant`: a builtin *constant*
-  ;; scrutinee of a `Case` is dispatched as a sum-of-products value
-  ;; (tag, #ctors, fields).  Returns (list tag numCtors fields) or #f.  Fields of
-  ;; a list/pair are carried as `sconst` (so `γ` is pointwise the machine's vcon).
-  ;; Mirrors `symConstToTagFields` (Bool: False=0/True=1, 2 ctors; Unit=0, 1 ctor;
-  ;; Integer n>=0 = tag n with 0 ctors = unbounded; list Cons=0/Nil=1; Pair=0).
-  (define (sym-const->tag-fields c)        ; c = (type . value)
-    (let ((ty (car c)) (v (cdr c)))
-      (cond
-       ((eq? ty 'bool)    (if v (list 1 2 '()) (list 0 2 '())))
-       ((eq? ty 'unit)    (list 0 1 '()))
-       ((eq? ty 'integer) (and (>= v 0) (list v 0 '())))
-       ((and (pair? ty) (eq? (car ty) 'list))
-        (let ((et (cadr ty)))                                  ; element type
-          (if (null? v)
-              (list 1 2 '())                                   ; Nil  = tag 1
-              (list 0 2 (list (sval-const (cons et (car v)))   ; head : et
-                              (sval-const (cons ty (cdr v))))))))  ; tail : (list et)
-       ((and (pair? ty) (eq? (car ty) 'pair))
-        (list 0 1 (list (sval-const (cons (cadr ty) (car v)))    ; fst : fst-type
-                        (sval-const (cons (caddr ty) (cdr v)))))) ; snd : snd-type
-       (else #f))))
-
-  ;;; ======================================================================
-  ;;; Constants.  A UPLC constant is (type . value).  Integer/Bool/ByteString and
-  ;;; Data / `(list data)` literals become first-order arithmetic/bytes/data `scon`
-  ;;; SMT terms (so literals compose with the symbolic builtins — e.g.
-  ;;; `mkCons (iData x) (con (list data) [])`, `equalsByteString (sha2_256 x) (con
-  ;;; bytestring …)`); every other constant type is carried concretely as `sconst`.
-  ;;; Mirrors `constToSym` / `dataToExpr`.
-  ;;; ======================================================================
-  (define (const->smt c)        ; the arithmetic-capable subset (kept for callers)
-    (case (car c)
-      ((integer) (smt-int (cdr c)))
-      ((bool) (smt-bool (cdr c)))
-      (else #f)))
-
-  ;; Translate a concrete Plutus Data value into the SMT Data term that denotes it
-  ;; (the constructor counterpart of unConstrData/dArgs/…), so a `con data …`
-  ;; literal is a first-order `scon`.  Plutus Data: (I n)/(B bv)/(Constr t fs)/
-  ;; (List ds)/(Map entries) where entries are (k . v) pairs.  Mirrors dataToExpr.
-  (define (data->expr d)
-    (case (car d)
-      ((I) (smt-uop 'idata (smt-int (cadr d))))
-      ((B) (smt-uop 'bdata (smt-lit-bs (cadr d))))
-      ((Constr) (smt-mk-constr-d (smt-int (cadr d)) (data-list->expr (caddr d))))
-      ((List) (smt-uop 'mk-dlist (data-list->expr (cadr d))))
-      ((Map) (smt-uop 'mk-map (data-pair-list->expr (cadr d))))
-      (else (error 'compile "bad Data literal" d))))
-  (define (data-list->expr ds)
-    (if (null? ds) (smt-nil 'data)
-        (smt-cons (data->expr (car ds)) (data-list->expr (cdr ds)))))
-  (define (data-pair-list->expr ps)
-    (if (null? ps) (smt-nil (smt-sort-pair 'data 'data))
-        (smt-cons (smt-mkpair (data->expr (caar ps)) (data->expr (cdar ps)))
-                  (data-pair-list->expr (cdr ps)))))
-
-  (define (const->sym c)
-    (let ((ty (car c)) (v (cdr c)))
-      (cond
-       ((eq? ty 'integer)    (sval-con (smt-int v)))
-       ((eq? ty 'bool)       (sval-con (smt-bool v)))
-       ((eq? ty 'bytestring) (sval-con (smt-lit-bs v)))
-       ((eq? ty 'data)       (sval-con (data->expr v)))
-       ((equal? ty (smt-sort-list 'data)) (sval-con (data-list->expr v)))  ; (con (list data) [...])
-       (else (sval-const c)))))
-
-  ;; constant builders (type . value), matching the (plutuss) constant rep.
-  (define (c-integer n) (cons 'integer n))
-  (define (c-bool b) (cons 'bool b))
-  (define (c-bytestring bv) (cons 'bytestring bv))
-  (define (c-unit) (cons 'unit '()))
-  (define (c-data d) (cons 'data d))
-
-  ;;; ======================================================================
-  ;;; Builtin metadata.  Identified by UPLC name; arity/forces from a real
-  ;;; descriptor record (via reflection) or from the static spec table.
-  ;;; ======================================================================
-  ;; (name forces arity) for every Plutus builtin (DefaultFunction order).
   (define builtin-specs
     '(("addInteger" 0 2) ("subtractInteger" 0 2) ("multiplyInteger" 0 2)
       ("divideInteger" 0 2) ("quotientInteger" 0 2) ("remainderInteger" 0 2)
@@ -247,517 +385,867 @@
       ("insertCoin" 0 4) ("lookupCoin" 0 3) ("unionValue" 0 2) ("valueContains" 0 2)
       ("valueData" 0 1) ("unValueData" 0 1) ("scaleValue" 0 2)
       ("bls12_381_G1_multiScalarMul" 0 2) ("bls12_381_G2_multiScalarMul" 0 2)))
-
   (define (builtin-spec name) (assoc name builtin-specs))
+  (define (replicate n x) (if (fx=? n 0) '() (cons x (replicate (fx- n 1) x))))
+  (define (expected-args name)
+    (let ((s (builtin-spec name)))
+      (if s (append (replicate (cadr s) 'q) (replicate (caddr s) 'v))
+          (error 'compile "unknown builtin" name))))
+  (define (ea-head ea) (car ea))
+  (define (ea-tail ea) (and (not (null? (cdr ea))) (cdr ea)))
 
-  ;; Read a named field of a record without importing the defining library.
   (define (record-field r fname)
     (let* ((rtd (record-rtd r)) (names (record-type-field-names rtd)))
       (let loop ((i 0))
         (cond ((fx>=? i (vector-length names)) (error 'compile "record has no field" fname))
               ((eq? (vector-ref names i) fname) ((record-accessor rtd i) r))
               (else (loop (fx+ i 1)))))))
-
   (define (builtin-name b)
     (cond ((string? b) b)
           ((symbol? b) (symbol->string b))
           ((record? b) (record-field b 'name))
           (else (error 'compile "bad builtin descriptor" b))))
-  (define (builtin-arity b)
-    (cond ((record? b) (record-field b 'arity))
-          (else (let ((s (builtin-spec (builtin-name b))))
-                  (if s (caddr s) (error 'compile "unknown builtin (arity)" (builtin-name b)))))))
-  (define (builtin-forces b)
-    (cond ((record? b) (record-field b 'forces))
-          (else (let ((s (builtin-spec (builtin-name b))))
-                  (if s (cadr s) (error 'compile "unknown builtin (forces)" (builtin-name b)))))))
 
-  ;;; ======================================================================
-  ;;; Symbolic builtin denotations.  Mirrors smtBuiltin / symBuiltinPassThrough
-  ;;; / symEvalBuiltin.  Arguments arrive newest-first (most recent first),
-  ;;; matching the machine's consed-argument convention; for a 2-ary builtin
-  ;;; that means (ey ex) = (second-arg first-arg).
-  ;;; ======================================================================
+  ;;; ---- evaluator --------------------------------------------------------
+  (define (branch-outcomes branches . maybe-extra)
+    (let ((extra (if (null? maybe-extra) '() (car maybe-extra))))
+      (append (append-map (lambda (br) (map-pc (car br) (cdr br))) branches)
+              (map out-error extra))))
+  (define (field-from-val-list xs) (sv-dyn (vl-hd xs)))
+  (define (tail-from-val-list xs) (sv-const (sc-const-list (vl-tl xs))))
+  (define (field-from-data-list xs) (sv-const (sc-data (dl-hd xs))))
+  (define (tail-from-data-list xs) (sv-const (sc-data-list (dl-tl xs))))
+  (define (division-guard b) (sNe b (s-int 0)))
+  (define (nonneg-guard x) (op-ge x (s-int 0)))
 
-  ;; first-order builtin: argument `smt` exprs -> (value-expr . definedness-guard) | #f
-  (define (sort-bin op grd need ex ey)
-    (and (smt-sort=? (smt-sort-of ex) need) (smt-sort=? (smt-sort-of ey) need)
-         (cons (smt-bin op ex ey) grd)))
-  (define (uop-build op grd need e)
-    (and (smt-sort=? (smt-sort-of e) need) (cons (smt-uop op e) grd)))
-  (define (unconstr-build e)
-    (and (smt-sort=? (smt-sort-of e) 'data)
-         (cons (smt-mkpair (smt-uop 'constr-tag e) (smt-uop 'dargs e)) (smt-uop 'isconstr e))))
-  (define (pair-proj mk e)
-    (and (sort-pair? (smt-sort-of e)) (cons (mk e) smt-true)))
-  (define (list-op-ne mk e)
-    (and (smt-sort=? (smt-sort-of e) (smt-sort-list 'data)) (cons (mk e) (smt-not (smt-null e)))))
-  (define (list-op-t mk e)
-    (and (smt-sort=? (smt-sort-of e) (smt-sort-list 'data)) (cons (mk e) smt-true)))
-  ;; A BLS binary/mixed op committing on its two declared operand sorts (axiomatized).
-  (define (bls-bin-build op ex ey)
-    (let ((os (smt-bls-operand-sorts op)))
-      (and (smt-sort=? (smt-sort-of ex) (car os)) (smt-sort=? (smt-sort-of ey) (cdr os))
-           (cons (smt-bls-bin op ex ey) smt-true))))
-  ;; A signature-verification op committing on three `bytes`-sorted operands (axiomatized).
-  (define (verify-sig-build kind pk msg sig)
-    (and (smt-sort=? (smt-sort-of pk) 'bytes) (smt-sort=? (smt-sort-of msg) 'bytes)
-         (smt-sort=? (smt-sort-of sig) 'bytes)
-         (cons (smt-verify-sig kind pk msg sig) smt-true)))
-  ;; Symbolic Data construction.  `constrData tag fields`: tag:int, fields:(list data)
-  ;; -> the Data term `mkConstr tag fields` (symbolic on BOTH).
-  (define (constr-data-op tag fields)
-    (and (smt-sort=? (smt-sort-of tag) 'int) (smt-sort=? (smt-sort-of fields) (smt-sort-list 'data))
-         (cons (smt-mk-constr-d tag fields) smt-true)))
-  ;; `mkCons h tl`: prepend a `data` head to a `list data` tail (the only element
-  ;; sort the CEK's ConstDataList supports) -> consL h tl.
-  (define (cons-data-op h tl)
-    (and (smt-sort=? (smt-sort-of h) 'data) (smt-sort=? (smt-sort-of tl) (smt-sort-list 'data))
-         (cons (smt-cons h tl) smt-true)))
-
-  (define (smt-builtin name args)
-    (case (length args)
-      ((1)
-       (let ((e (car args)))
-         (cond
-          ((string=? name "iData") (uop-build 'idata smt-true 'int e))
-          ((string=? name "bData") (uop-build 'bdata smt-true 'bytes e))
-          ((string=? name "unIData") (uop-build 'unidata (smt-uop 'isi e) 'data e))
-          ((string=? name "unBData") (uop-build 'unbdata (smt-uop 'isb e) 'data e))
-          ((string=? name "unConstrData") (unconstr-build e))
-          ((string=? name "unListData") (uop-build 'ditems (smt-uop 'islist e) 'data e))
-          ((string=? name "listData") (uop-build 'mk-dlist smt-true (smt-sort-list 'data) e)) ; list data -> Data
-          ;; (mapData -> mkMap deferred, as in moist: the empty ConstPairDataList/ConstDataList
-          ;;  ambiguity; the mkMap UnOp exists in (plutuss smt) but is not dispatched here.)
-          ((string=? name "fstPair") (pair-proj smt-fst e))
-          ((string=? name "sndPair") (pair-proj smt-snd e))
-          ((string=? name "headList") (list-op-ne (lambda (x) (smt-head 'data x)) e))
-          ((string=? name "tailList") (list-op-ne smt-tail e))
-          ((string=? name "nullList") (list-op-t smt-null e))
-          ((string=? name "lengthOfByteString") (uop-build 'len-bytes smt-true 'bytes e))
-          ;; cryptographic hashes (bytes -> bytes, axiomatized as uninterpreted fns)
-          ((string=? name "sha2_256")    (uop-build 'sha2-256 smt-true 'bytes e))
-          ((string=? name "sha3_256")    (uop-build 'sha3-256 smt-true 'bytes e))
-          ((string=? name "blake2b_256") (uop-build 'blake2b-256 smt-true 'bytes e))
-          ((string=? name "blake2b_224") (uop-build 'blake2b-224 smt-true 'bytes e))
-          ((string=? name "keccak_256")  (uop-build 'keccak-256 smt-true 'bytes e))
-          ((string=? name "ripemd_160")  (uop-build 'ripemd-160 smt-true 'bytes e))
-          ((string=? name "serialiseData") (uop-build 'serialise-data smt-true 'data e)) ; data -> bytes
-          ;; BLS12-381 unary (bytes -> bytes; elements as compressed bytes)
-          ((string=? name "bls12_381_G1_neg") (uop-build 'bls-g1-neg smt-true 'bytes e))
-          ((string=? name "bls12_381_G2_neg") (uop-build 'bls-g2-neg smt-true 'bytes e))
-          ((string=? name "bls12_381_G1_compress") (uop-build 'bls-g1-compress smt-true 'bytes e))
-          ((string=? name "bls12_381_G2_compress") (uop-build 'bls-g2-compress smt-true 'bytes e))
-          ((string=? name "bls12_381_G1_uncompress") (uop-build 'bls-g1-uncompress smt-true 'bytes e))
-          ((string=? name "bls12_381_G2_uncompress") (uop-build 'bls-g2-uncompress smt-true 'bytes e))
-          (else #f))))
-      ((2)
-       (let ((ey (car args)) (ex (cadr args)))
-         (cond
-          ((string=? name "addInteger")            (sort-bin 'add smt-true 'int ex ey))
-          ((string=? name "subtractInteger")       (sort-bin 'sub smt-true 'int ex ey))
-          ((string=? name "multiplyInteger")       (sort-bin 'mul smt-true 'int ex ey))
-          ((string=? name "divideInteger")         (sort-bin 'fdiv (smt-ne-zero ey) 'int ex ey))
-          ((string=? name "modInteger")            (sort-bin 'fmod (smt-ne-zero ey) 'int ex ey))
-          ((string=? name "quotientInteger")       (sort-bin 'tdiv (smt-ne-zero ey) 'int ex ey))
-          ((string=? name "remainderInteger")      (sort-bin 'tmod (smt-ne-zero ey) 'int ex ey))
-          ((string=? name "equalsInteger")         (sort-bin 'eq smt-true 'int ex ey))
-          ((string=? name "lessThanInteger")       (sort-bin 'lt smt-true 'int ex ey))
-          ((string=? name "lessThanEqualsInteger") (sort-bin 'le smt-true 'int ex ey))
-          ((string=? name "equalsData")            (sort-bin 'eq smt-true 'data ex ey))
-          ((string=? name "equalsByteString")      (sort-bin 'eq smt-true 'bytes ex ey))
-          ;; Data construction (symbolic on both): constrData tag fields (ex=tag, ey=fields);
-          ;; mkCons h tl on a list-data (ex=head, ey=tail).
-          ((string=? name "constrData")            (constr-data-op ex ey))
-          ((string=? name "mkCons")                (cons-data-op ex ey))
-          ;; BLS12-381 binary / mixed (operand1 = ex = 1st UPLC arg, operand2 = ey)
-          ((string=? name "bls12_381_G1_add")         (bls-bin-build 'g1-add ex ey))
-          ((string=? name "bls12_381_G2_add")         (bls-bin-build 'g2-add ex ey))
-          ((string=? name "bls12_381_mulMlResult")    (bls-bin-build 'mul-ml-result ex ey))
-          ((string=? name "bls12_381_G1_hashToGroup") (bls-bin-build 'g1-hash-to-group ex ey))
-          ((string=? name "bls12_381_G2_hashToGroup") (bls-bin-build 'g2-hash-to-group ex ey))
-          ((string=? name "bls12_381_millerLoop")     (bls-bin-build 'miller-loop ex ey))
-          ((string=? name "bls12_381_G1_equal")       (bls-bin-build 'g1-equal ex ey))
-          ((string=? name "bls12_381_G2_equal")       (bls-bin-build 'g2-equal ex ey))
-          ((string=? name "bls12_381_finalVerify")    (bls-bin-build 'final-verify ex ey))
-          ;; scalarMul: scalar (ex, int) x point (ey, bytes)
-          ((string=? name "bls12_381_G1_scalarMul")   (bls-bin-build 'g1-scalar-mul ex ey))
-          ((string=? name "bls12_381_G2_scalarMul")   (bls-bin-build 'g2-scalar-mul ex ey))
-          (else #f))))
-      ((3)
-       ;; reversed args: signature, message, pubkey
-       (let ((eSig (car args)) (eMsg (cadr args)) (ePk (caddr args)))
-         (cond
-          ((string=? name "verifyEd25519Signature")          (verify-sig-build 'ed25519 ePk eMsg eSig))
-          ((string=? name "verifyEcdsaSecp256k1Signature")   (verify-sig-build 'ecdsa ePk eMsg eSig))
-          ((string=? name "verifySchnorrSecp256k1Signature") (verify-sig-build 'schnorr ePk eMsg eSig))
-          (else #f))))
-      (else #f)))
-
-  ;; pass-through builtins whose result is one of their value arguments; they
-  ;; must NOT be routed through the concrete fold.  Mirrors isPassthroughBuiltin.
-  (define (passthrough-builtin? name)
-    (member name '("ifThenElse" "chooseUnit" "trace" "chooseData" "chooseList" "mkCons")))
-
-  ;; recognise a fully concrete `sconst` of a given const type ('unit 'string ...)
-  (define (sconst-of-type? v ty) (and (eq? (sym-vtag v) 'sconst) (eq? (car (sconst-c v)) ty)))
-  ;; recognise a fully concrete list-typed `sconst`; returns its (type . items) const or #f
-  (define (sconst-list v)
-    (and (eq? (sym-vtag v) 'sconst)
-         (let ((c (sconst-c v))) (and (pair? (car c)) (eq? (caar c) 'list) c))))
-
-  ;; Pass-through builtins (return one of their value arguments).  Mirrors
-  ;; symBuiltinPassThrough.  Args arrive newest-first.
-  ;;   ifThenElse: concrete bool picks the branch; symbolic bool with first-order
-  ;;     branches becomes an SMT `ite`, otherwise a deferred `site`.
-  ;;   trace s v = v ; chooseUnit u v = v  (the discriminant must be concrete).
-  ;;   chooseData / chooseList: dispatch on a *concrete* Data variant / list-empty.
-  ;;   mkCons x xs: cons a concrete element onto a concrete list.
-  ;; NOTE: these discriminants must be `sConst`.  Since `const->sym` now lifts
-  ;; `data` / `(list data)` literals to first-order `sCon` (so they compose with the
-  ;; symbolic builtins), `chooseData`/`chooseList` on a `data`/`(list data)` literal
-  ;; no longer match here and are refused — faithful to moist (its passthroughs are
-  ;; unchanged).  `mkCons` on `data` goes through `cons-data-op` (smtBuiltin) instead.
-  (define (sym-builtin-passthrough b args)
-    (let ((name (builtin-name b)))
-      (cond
-       ((string=? name "ifThenElse")
-        (and (fx=? (length args) 3)
-             (let ((elseV (car args)) (thenV (cadr args)) (condV (caddr args)))
-               (and (eq? (sym-vtag condV) 'scon)
-                    (let ((condE (scon-e condV)))
-                      (cond
-                       ((eq? (smt-tag condE) 'lit-b)
-                        (if (vector-ref condE 1) (sout thenV smt-true) (sout elseV smt-true)))
-                       ((eq? (smt-sort-of condE) 'bool)
-                        (if (and (eq? (sym-vtag thenV) 'scon) (eq? (sym-vtag elseV) 'scon))
-                            (sout (sval-con (smt-ite condE (scon-e thenV) (scon-e elseV))) smt-true)
-                            (sout (sval-ite condE thenV elseV) smt-true)))
-                       (else #f)))))))
-       ((string=? name "chooseUnit")    ; [result, sConst Unit] -> result
-        (and (fx=? (length args) 2) (sconst-of-type? (cadr args) 'unit)
-             (sout (car args) smt-true)))
-       ((string=? name "trace")         ; [result, sConst (String _)] -> result
-        (and (fx=? (length args) 2) (sconst-of-type? (cadr args) 'string)
-             (sout (car args) smt-true)))
-       ((string=? name "chooseData")    ; [bC iC lC mC cC (sConst (Data d))] -> branch by variant
-        (and (fx=? (length args) 6) (sconst-of-type? (list-ref args 5) 'data)
-             (let ((branch (case (car (cdr (sconst-c (list-ref args 5))))   ; (car data-value)
-                             ((Constr) (list-ref args 4))    ; cC
-                             ((Map)    (list-ref args 3))    ; mC
-                             ((List)   (list-ref args 2))    ; lC
-                             ((I)      (list-ref args 1))    ; iC
-                             ((B)      (list-ref args 0))    ; bC
-                             (else #f))))
-               (and branch (sout branch smt-true)))))
-       ((string=? name "chooseList")    ; [consC, nilC, (sConst list)] -> nilC if empty else consC
-        (and (fx=? (length args) 3)
-             (let ((lc (sconst-list (list-ref args 2))))
-               (and lc (sout (if (null? (cdr lc)) (list-ref args 1) (list-ref args 0)) smt-true)))))
-       ((string=? name "mkCons")        ; [sConst(list tl), sConst x] -> sConst(list (x::tl))
-        (and (fx=? (length args) 2)
-             (let ((lc (sconst-list (car args))) (x (cadr args)))
-               (and lc (eq? (sym-vtag x) 'sconst)
-                    (equal? (car (sconst-c x)) (cadr (car lc)))   ; element type matches list ET
-                    (sout (sval-const (cons (car lc) (cons (cdr (sconst-c x)) (cdr lc)))) smt-true)))))
-       (else #f))))
-
-  ;; extract argument exprs from `scon`-wrapped values; #f if any is not scon.
-  (define (sym-extract-cons args)
-    (cond ((null? args) '())
-          ((eq? (sym-vtag (car args)) 'scon)
-           (let ((rest (sym-extract-cons (cdr args))))
-             (and rest (cons (scon-e (car args)) rest))))
-          (else #f)))
-
-  (define (sym-builtin-symbolic b args)
-    (let ((exprs (sym-extract-cons args)))
-      (and exprs
-           (let ((r (smt-builtin (builtin-name b) exprs)))
-             (and r (sout (sval-con (car r)) (cdr r)))))))
-
-  ;; extract fully concrete consts ((type . value)) from symbolic args, for the
-  ;; optional concrete fold; #f if any argument is genuinely symbolic.
-  (define (sym-concrete args)
-    (cond
-     ((null? args) '())
-     (else
-      (let ((a (car args)))
-        (cond
-         ((eq? (sym-vtag a) 'sconst)
-          (let ((r (sym-concrete (cdr args)))) (and r (cons (sconst-c a) r))))
-         ((and (eq? (sym-vtag a) 'scon) (eq? (smt-tag (scon-e a)) 'lit-i))
-          (let ((r (sym-concrete (cdr args)))) (and r (cons (cons 'integer (vector-ref (scon-e a) 1)) r))))
-         ((and (eq? (sym-vtag a) 'scon) (eq? (smt-tag (scon-e a)) 'lit-b))
-          (let ((r (sym-concrete (cdr args)))) (and r (cons (cons 'bool (vector-ref (scon-e a) 1)) r))))
-         (else #f))))))
-
-  ;; Optional concrete-fold hook.  A procedure (name reversed-consts) -> const | #f
-  ;; that evaluates a fully-concrete builtin application (consts newest-first,
-  ;; matching the machine's reversed-arg convention) and returns the resulting
-  ;; (type . value) constant, or #f to decline.  Default declines (sound: the
-  ;; builtin is then refused).  A (plutuss machine)-backed implementation can be
-  ;; installed for full concrete coverage; kept out of the core so this library
-  ;; stays free of the native-crypto FFI.
-  (define current-concrete-builtin
-    (make-parameter (lambda (name rev-consts) #f)))
-
-  ;; `mkNilData ()` -> a *symbolic* empty `list data` (so it composes with the
-  ;; symbolic `mkCons`).  Its own stage (not pass-through/smtBuiltin) because its
-  ;; argument is the concrete `sConst Unit`, not an `sCon`.  Mirrors `symNil`.
-  ;; (`mkNilPairData` -> empty (list (pair data data)) is the map path: deferred.)
-  (define (sym-nil b args)
-    (and (string=? (builtin-name b) "mkNilData")
-         (fx=? (length args) 1)
-         (let ((a (car args)))
-           (and (eq? (sym-vtag a) 'sconst) (eq? (car (sconst-c a)) 'unit)
-                (sout (sval-con (smt-nil 'data)) smt-true)))))
-
-  ;; Evaluate a saturated builtin symbolically: the mkNilData stage, then
-  ;; pass-through, then the symbolic table, then the concrete fold.  Mirrors symEvalBuiltin.
-  (define (sym-eval-builtin b args)
-    (or (sym-nil b args)
-        (sym-builtin-passthrough b args)
-        (sym-builtin-symbolic b args)
-        (and (not (passthrough-builtin? (builtin-name b)))
-             (let ((consts (sym-concrete args)))
-               (and consts
-                    (let ((c ((current-concrete-builtin) (builtin-name b) consts)))
-                      (and c (sout (sval-const c) smt-true))))))))
-
-  ;;; ======================================================================
-  ;;; combine-ite: merge the two branches of a deferred `site` after both have
-  ;;; been forced/applied/cased, emitting an SMT `ite`.  A branch that failed
-  ;;; (fuel/refusal) makes that path undefined.  Mirrors combineIte.
-  ;;; ======================================================================
-  (define (combine-ite cnd oa ob)
-    (cond
-     ((and oa ob)
-      (let ((va (sout-value oa)) (ad (sout-defined oa))
-            (vb (sout-value ob)) (bd (sout-defined ob)))
-        (if (and (eq? (sym-vtag va) 'scon) (eq? (sym-vtag vb) 'scon))
-            (sout (sval-con (smt-ite cnd (scon-e va) (scon-e vb))) (smt-ite cnd ad bd))
-            (sout (sval-ite cnd va vb) (smt-ite cnd ad bd)))))
-     (oa (sout (sout-value oa) (smt-ite cnd (sout-defined oa) smt-false)))
-     (ob (sout (sout-value ob) (smt-ite cnd smt-false (sout-defined ob))))
-     (else #f)))
-
-  ;;; ======================================================================
-  ;;; The symbolic evaluator.  Five mutually-recursive functions + sym-case,
-  ;;; mirroring symEval/symApply/symForce/symEvalList/symApplyList/symCase.
-  ;;; `fuel` bounds the recursion; 0 => refuse (#f).
-  ;;; ======================================================================
-  (define (sym-eval fuel env t)
-    (if (fx=? fuel 0) #f
+  (define (eval-sym fuel rho t)
+    (if (fx=? fuel 0) timeout
         (let ((n (fx- fuel 1)))
           (match t
-            ((var k)
-             (let ((v (sym-env-lookup env k))) (and v (sout v smt-true))))
-            ((con c) (sout (const->sym c) smt-true))
-            ((builtin b) (sout (sval-builtin b 0 '() 0) smt-true))
-            ((lam nm body) (sout (sval-lam nm body env) smt-true))
-            ((delay body) (sout (sval-delay body env) smt-true))
+            ((var k) (let ((v (lookup-env rho k))) (if v (ok v) err)))
+            ((con c) (ok (const-literal c)))
+            ((builtin desc)
+             (let ((nm (builtin-name desc)))
+               (ok (sv-builtin nm '() (expected-args nm)))))
+            ((lam _ body) (ok (sv-lam body rho)))
+            ((delay body) (ok (sv-delay body rho)))
             ((app f a)
-             (let ((of (sym-eval n env f)))
-               (and of
-                    (let ((oa (sym-eval n env a)))
-                      (and oa
-                           (let ((oap (sym-apply n (sout-value of) (sout-value oa))))
-                             (and oap
-                                  (sout (sout-value oap)
-                                        (smt-and (sout-defined of)
-                                                 (smt-and (sout-defined oa) (sout-defined oap)))))))))))
+             (bind-out (eval-sym n rho f)
+               (lambda (vf)
+                 (bind-out (eval-sym n rho a)
+                   (lambda (va) (apply-sym n vf va))))))
             ((force tt)
-             (let ((ot (sym-eval n env tt)))
-               (and ot
-                    (let ((ofo (sym-force n (sout-value ot))))
-                      (and ofo
-                           (sout (sout-value ofo) (smt-and (sout-defined ot) (sout-defined ofo))))))))
-            ((constr tag ms)
-             (let ((r (sym-eval-list n env ms)))
-               (and r (sout (sval-constr tag (car r)) (cdr r)))))
+             (bind-out (eval-sym n rho tt)
+               (lambda (vt) (force-sym n vt))))
+            ((constr tag fields)
+             (bind-out (eval-list-sym n rho fields)
+               (lambda (vals)
+                 (if (and (eq? (symv-tag vals) 'constr)
+                          (s-beq (vector-ref vals 1) (s-int -1)))
+                     (ok (sv-constr (s-int tag) (vector-ref vals 2)))
+                     err))))
             ((case scrut alts)
-             (let ((osc (sym-eval n env scrut)))
-               (and osc
-                    (let ((sv (sout-value osc)))
-                      (cond
-                       ((eq? (sym-vtag sv) 'sconstr)
-                        (let ((alt (nth? alts (sconstr-tag sv))))
-                          (and alt
-                               (let ((oalt (sym-eval n env alt)))
-                                 (and oalt
-                                      (let ((oap (sym-apply-list n (sout-value oalt) (sconstr-fields sv))))
-                                        (and oap
-                                             (sout (sout-value oap)
-                                                   (smt-and (sout-defined osc)
-                                                            (smt-and (sout-defined oalt) (sout-defined oap)))))))))))
-                       ;; symbolic choice (site), builtin constant (sconst, SOP
-                       ;; dispatch), or (possibly symbolic) Bool/Integer/list/pair
-                       ;; scalar (scon) ==> dispatch through sym-case
-                       ((memq (sym-vtag sv) '(site sconst scon))
-                        (let ((oc (sym-case n env sv alts)))
-                          (and oc (sout (sout-value oc) (smt-and (sout-defined osc) (sout-defined oc))))))
-                       (else #f))))))         ; a closure scrutinee => genuinely ill-typed => refuse
-            ((uerror) #f)
-            (else (error 'sym-eval "bad term" t))))))
+             (bind-out (eval-sym n rho scrut)
+               (lambda (v) (case-sym n rho v alts))))
+            ((uerror) err)
+            (else (error 'eval-sym "bad term" t))))))
+  (define sym-eval eval-sym)
 
-  (define (sym-apply fuel vf va)
-    (if (fx=? fuel 0) #f
+  (define (eval-list-sym fuel rho ts)
+    (if (null? ts)
+        (ok (sv-constr (s-int -1) '()))
+        (bind-out (eval-sym fuel rho (car ts))
+          (lambda (v)
+            (bind-out (eval-list-sym fuel rho (cdr ts))
+              (lambda (rest)
+                (if (and (eq? (symv-tag rest) 'constr)
+                         (s-beq (vector-ref rest 1) (s-int -1)))
+                    (ok (sv-constr (s-int -1) (cons v (vector-ref rest 2))))
+                    err)))))))
+
+  (define (apply-sym fuel vf va)
+    (if (fx=? fuel 0) timeout
         (let ((n (fx- fuel 1)))
-          (case (sym-vtag vf)
-            ((slam) (sym-eval n (sym-env-extend (slam-env vf) va) (slam-body vf)))
-            ((sbuiltin)
-             (let ((b (sbuiltin-fn vf)) (forces (sbuiltin-forces vf))
-                   (args (sbuiltin-args vf)) (nargs (sbuiltin-nargs vf)))
-               (if (and (fx>=? forces (builtin-forces b)) (fx<? nargs (builtin-arity b)))
-                   (let ((args2 (cons va args)) (nargs2 (fx+ nargs 1)))
-                     (if (fx=? nargs2 (builtin-arity b))
-                         (sym-eval-builtin b args2)
-                         (sout (sval-builtin b forces args2 nargs2) smt-true)))
-                   #f)))
-            ((site) (combine-ite (site-cond vf) (sym-apply n (site-a vf) va) (sym-apply n (site-b vf) va)))
-            (else #f)))))
+          (case (symv-tag vf)
+            ((lam) (eval-sym n (extend-env (vector-ref vf 2) va) (vector-ref vf 1)))
+            ((builtin)
+             (let ((b (vector-ref vf 1)) (args (vector-ref vf 2)) (ea (vector-ref vf 3)))
+               (case (ea-head ea)
+                 ((v) (let ((rest (ea-tail ea)))
+                        (if rest
+                            (ok (sv-builtin b (cons va args) rest))
+                            (eval-builtin-sym b (cons va args)))))
+                 ((q) err)
+                 (else (error 'apply-sym "bad expected arg" ea)))))
+            (else err)))))
+  (define sym-apply apply-sym)
 
-  (define (sym-force fuel vf)
-    (if (fx=? fuel 0) #f
+  (define (force-sym fuel vf)
+    (if (fx=? fuel 0) timeout
         (let ((n (fx- fuel 1)))
-          (case (sym-vtag vf)
-            ((sdelay) (sym-eval n (sdelay-env vf) (sdelay-body vf)))
-            ((sbuiltin)
-             (let ((b (sbuiltin-fn vf)) (forces (sbuiltin-forces vf))
-                   (args (sbuiltin-args vf)) (nargs (sbuiltin-nargs vf)))
-               (if (fx<? forces (builtin-forces b))
-                   (let ((forces2 (fx+ forces 1)))
-                     (if (and (fx=? forces2 (builtin-forces b)) (fx=? nargs (builtin-arity b)))
-                         (sym-eval-builtin b args)
-                         (sout (sval-builtin b forces2 args nargs) smt-true)))
-                   #f)))
-            ((site) (combine-ite (site-cond vf) (sym-force n (site-a vf)) (sym-force n (site-b vf))))
-            (else #f)))))
+          (case (symv-tag vf)
+            ((delay) (eval-sym n (vector-ref vf 2) (vector-ref vf 1)))
+            ((builtin)
+             (let ((b (vector-ref vf 1)) (args (vector-ref vf 2)) (ea (vector-ref vf 3)))
+               (case (ea-head ea)
+                 ((q) (let ((rest (ea-tail ea)))
+                        (if rest
+                            (ok (sv-builtin b args rest))
+                            (eval-builtin-sym b args))))
+                 ((v) err)
+                 (else (error 'force-sym "bad expected arg" ea)))))
+            (else err)))))
+  (define sym-force force-sym)
 
-  (define (sym-eval-list fuel env ts)
-    (if (null? ts) (cons '() smt-true)
-        (let ((o (sym-eval fuel env (car ts))))
-          (and o
-               (let ((r (sym-eval-list fuel env (cdr ts))))
-                 (and r (cons (cons (sout-value o) (car r))
-                              (smt-and (sout-defined o) (cdr r)))))))))
+  (define (apply-list-sym fuel vf args)
+    (if (null? args)
+        (ok vf)
+        (bind-out (apply-sym fuel vf (car args))
+          (lambda (vf2) (apply-list-sym fuel vf2 (cdr args))))))
 
-  (define (sym-apply-list fuel vf args)
-    (if (null? args) (sout vf smt-true)
-        (let ((o (sym-apply fuel vf (car args))))
-          (and o
-               (let ((o2 (sym-apply-list fuel (sout-value o) (cdr args))))
-                 (and o2 (sout (sout-value o2) (smt-and (sout-defined o) (sout-defined o2)))))))))
-
-  (define (sym-case fuel env sv alts)
-    (if (fx=? fuel 0) #f
+  (define (apply-val-list-sym fuel vf xs)
+    (if (fx=? fuel 0) timeout
         (let ((n (fx- fuel 1)))
-          (case (sym-vtag sv)
-            ((sconstr)
-             (let ((alt (nth? alts (sconstr-tag sv))))
-               (and alt
-                    (let ((oalt (sym-eval n env alt)))
-                      (and oalt
-                           (let ((oap (sym-apply-list n (sout-value oalt) (sconstr-fields sv))))
-                             (and oap (sout (sout-value oap)
-                                            (smt-and (sout-defined oalt) (sout-defined oap))))))))))
-            ((site)
-             (combine-ite (site-cond sv)
-                          (sym-case fuel env (site-a sv) alts)
-                          (sym-case fuel env (site-b sv) alts)))
-            ((sconst) (sym-case-const n env (sconst-c sv) alts))
-            ((scon)   (sym-case-scon n env (scon-e sv) alts))
-            (else #f)))))
+          (branch-outcomes
+           (list
+            (cons (vl-is-nil xs) (ok vf))
+            (cons (sNot (vl-is-nil xs))
+                  (bind-out (apply-sym n vf (sv-dyn (vl-hd xs)))
+                    (lambda (vf2) (apply-val-list-sym n vf2 (vl-tl xs))))))))))
 
-  ;; `Case` on a builtin *constant* scrutinee (Bool/Unit/Integer/list/pair): SOP
-  ;; dispatch via `sym-const->tag-fields` (mirrors symCase's `.sConst` clause).
-  (define (sym-case-const n env c alts)
-    (let ((tf (sym-const->tag-fields c)))
-      (and tf
-           (let ((tag (car tf)) (numctors (cadr tf)) (fields (caddr tf)))
-             (if (and (fx>? numctors 0) (fx>? (length alts) numctors))
-                 #f
-                 (let ((alt (nth? alts tag)))
-                   (and alt
-                        (let ((oalt (sym-eval n env alt)))
-                          (and oalt
-                               (let ((oap (sym-apply-list n (sout-value oalt) fields)))
-                                 (and oap (sout (sout-value oap)
-                                                (smt-and (sout-defined oalt) (sout-defined oap))))))))))))))
+  (define (alt-branches-by-tag n rho alts tag fields?)
+    (map (lambda (ia)
+           (let ((i (car ia)) (alt (cdr ia)))
+             (cons (sEq tag (s-int i))
+                   (bind-out (eval-sym n rho alt)
+                     (lambda (v-alt) (if fields? (apply-list-sym n v-alt fields?) (ok v-alt)))))))
+         (enum-list alts)))
 
-  ;; `Case` on a (possibly symbolic) first-order `scon` scrutinee.  Bool: tags
-  ;; False=0/True=1 ⇒ `ite e alt1 alt0`.  Integer: tag = value ⇒ nested
-  ;; `ite (e==i) altᵢ …`.  list data: Cons=0 (head/tail fields)/Nil=1 ⇒ split on
-  ;; `nullL`.  pair: a single ctor (tag 0) with fst/snd fields.  Mirrors symCase's
-  ;; `.sCon` clause.
-  (define (sym-case-scon n env e alts)
-    (let ((s (smt-sort-of e)))
+  (define (case-sym fuel rho sv alts)
+    (case (symv-tag sv)
+      ((constr)
+       (let* ((tag (vector-ref sv 1))
+              (fields (vector-ref sv 2))
+              (branches
+               (map (lambda (ia)
+                      (let ((i (car ia)) (alt (cdr ia)))
+                        (cons (sEq tag (s-int i))
+                              (bind-out (eval-sym fuel rho alt)
+                                (lambda (v-alt) (apply-list-sym fuel v-alt fields))))))
+                    (enum-list alts)))
+              (covered (sAny (map car branches))))
+         (branch-outcomes branches (list (sNot covered)))))
+      ((const)
+       (let ((c (vector-ref sv 1)))
+         (case (vector-ref c 0)
+           ((bool) (case-bool fuel rho (vector-ref c 1) alts))
+           ((unit) (case-unit fuel rho alts))
+           ((integer) (case-integer fuel rho (vector-ref c 1) alts))
+           ((constList) (case-const-list fuel rho (vector-ref c 1) alts))
+           ((dataList) (case-data-list fuel rho (vector-ref c 1) alts))
+           ((pairData) (case-pair-data fuel rho (vector-ref c 1) (vector-ref c 2) alts))
+           (else err))))
+      ((pair) (case-pair fuel rho (vector-ref sv 1) (vector-ref sv 2) alts))
+      ((dyn) (case-dyn fuel rho (vector-ref sv 1) alts))
+      (else err)))
+  (define sym-case case-sym)
+
+  (define (case-bool n rho b alts)
+    (let ((tag (sIte b (s-int 1) (s-int 0))))
+      (if (> (length alts) 2) err
+          (let* ((branches (map (lambda (ia)
+                                  (cons (sEq tag (s-int (car ia))) (eval-sym n rho (cdr ia))))
+                                (enum-list alts)))
+                 (covered (sAny (map car branches))))
+            (branch-outcomes branches (list (sNot covered)))))))
+  (define (case-unit n rho alts)
+    (if (> (length alts) 1) err
+        (let ((alt (list-ref? alts 0))) (if alt (eval-sym n rho alt) err))))
+  (define (case-integer n rho x alts)
+    (let* ((branches (map (lambda (ia)
+                            (cons (sAll (list (nonneg-guard x) (sEq x (s-int (car ia)))))
+                                  (eval-sym n rho (cdr ia))))
+                          (enum-list alts)))
+           (covered (sAnd (nonneg-guard x)
+                          (sAny (map (lambda (ia) (sEq x (s-int (car ia)))) (enum-list alts))))))
+      (branch-outcomes branches (list (sNot covered)))))
+  (define (case-const-list n rho xs alts)
+    (if (> (length alts) 2) err
+        (let* ((nil-alt (list-ref? alts 1))
+               (cons-alt (list-ref? alts 0))
+               (nil-branch (if nil-alt (list (cons (vl-is-nil xs) (eval-sym n rho nil-alt))) '()))
+               (cons-branch
+                (if cons-alt
+                    (list (cons (sNot (vl-is-nil xs))
+                                (bind-out (eval-sym n rho cons-alt)
+                                  (lambda (v-alt)
+                                    (apply-list-sym n v-alt
+                                                    (list (field-from-val-list xs)
+                                                          (tail-from-val-list xs)))))))
+                    '()))
+               (branches (append cons-branch nil-branch)))
+          (branch-outcomes branches (list (sNot (sAny (map car branches))))))))
+  (define (case-data-list n rho xs alts)
+    (if (> (length alts) 2) err
+        (let* ((nil-alt (list-ref? alts 1))
+               (cons-alt (list-ref? alts 0))
+               (nil-branch (if nil-alt (list (cons (dl-is-nil xs) (eval-sym n rho nil-alt))) '()))
+               (cons-branch
+                (if cons-alt
+                    (list (cons (sNot (dl-is-nil xs))
+                                (bind-out (eval-sym n rho cons-alt)
+                                  (lambda (v-alt)
+                                    (apply-list-sym n v-alt
+                                                    (list (field-from-data-list xs)
+                                                          (tail-from-data-list xs)))))))
+                    '()))
+               (branches (append cons-branch nil-branch)))
+          (branch-outcomes branches (list (sNot (sAny (map car branches))))))))
+  (define (case-pair n rho a b alts)
+    (if (> (length alts) 1) err
+        (let ((alt (list-ref? alts 0)))
+          (if alt
+              (bind-out (eval-sym n rho alt)
+                (lambda (v-alt) (apply-list-sym n v-alt (list a b))))
+              err))))
+  (define (case-pair-data n rho a b alts)
+    (if (> (length alts) 1) err
+        (let ((alt (list-ref? alts 0)))
+          (if alt
+              (bind-out (eval-sym n rho alt)
+                (lambda (v-alt) (apply-list-sym n v-alt (list (sv-const (sc-data a))
+                                                              (sv-const (sc-data b))))))
+              err))))
+
+  (define (case-dyn n rho v alts)
+    (let* ((enum (enum-list alts))
+           (tag-covered (lambda (tag) (sAny (map (lambda (ia) (sEq tag (s-int (car ia)))) enum))))
+           (bool-tag (sIte (v-as-bool v) (s-int 1) (s-int 0)))
+           (bool-branches
+            (if (> (length alts) 2) '()
+                (map (lambda (ia)
+                       (cons (sAll (list (v-is-con "VBool" v) (sEq bool-tag (s-int (car ia)))))
+                             (eval-sym n rho (cdr ia))))
+                     enum)))
+           (bool-error
+            (if (> (length alts) 2)
+                (v-is-con "VBool" v)
+                (sAnd (v-is-con "VBool" v) (sNot (tag-covered bool-tag)))))
+           (unit-branches
+            (if (> (length alts) 1) '()
+                (let ((alt (list-ref? alts 0)))
+                  (if alt (list (cons (v-is-con "VUnit" v) (eval-sym n rho alt))) '()))))
+           (unit-error
+            (if (> (length alts) 1)
+                (v-is-con "VUnit" v)
+                (sAnd (v-is-con "VUnit" v) (sNot (sAny (map car unit-branches))))))
+           (int-val (v-as-int v))
+           (int-branches
+            (map (lambda (ia)
+                   (cons (sAll (list (v-is-con "VInt" v) (nonneg-guard int-val)
+                                     (sEq int-val (s-int (car ia)))))
+                         (eval-sym n rho (cdr ia))))
+                 enum))
+           (int-error
+            (sAnd (v-is-con "VInt" v)
+                  (sNot (sAnd (nonneg-guard int-val) (tag-covered int-val)))))
+           (list-val (v-as-list v))
+           (list-branches (dyn-list-branches n rho v "VList" list-val vl-is-nil
+                                             field-from-val-list tail-from-val-list alts))
+           (list-error
+            (if (> (length alts) 2)
+                (v-is-con "VList" v)
+                (sAnd (v-is-con "VList" v) (sNot (sAny (map car list-branches))))))
+           (data-list-val (v-as-dl v))
+           (data-list-branches (dyn-list-branches n rho v "VDataList" data-list-val dl-is-nil
+                                                  field-from-data-list tail-from-data-list alts))
+           (data-list-error
+            (if (> (length alts) 2)
+                (v-is-con "VDataList" v)
+                (sAnd (v-is-con "VDataList" v) (sNot (sAny (map car data-list-branches))))))
+           (pair-branches
+            (if (> (length alts) 1) '()
+                (let ((alt (list-ref? alts 0)))
+                  (if alt
+                      (list (cons (v-is-con "VPair" v)
+                                  (bind-out (eval-sym n rho alt)
+                                    (lambda (v-alt)
+                                      (apply-list-sym n v-alt
+                                                      (list (sv-dyn (v-fst v)) (sv-dyn (v-snd v))))))))
+                      '()))))
+           (pair-error
+            (if (> (length alts) 1)
+                (v-is-con "VPair" v)
+                (sAnd (v-is-con "VPair" v) (sNot (sAny (map car pair-branches))))))
+           (pair-data-branches
+            (if (> (length alts) 1) '()
+                (let ((alt (list-ref? alts 0)))
+                  (if alt
+                      (list (cons (v-is-con "VPairData" v)
+                                  (bind-out (eval-sym n rho alt)
+                                    (lambda (v-alt)
+                                      (apply-list-sym n v-alt
+                                                      (list (sv-const (sc-data (v-fst-d v)))
+                                                            (sv-const (sc-data (v-snd-d v)))))))))
+                      '()))))
+           (pair-data-error
+            (if (> (length alts) 1)
+                (v-is-con "VPairData" v)
+                (sAnd (v-is-con "VPairData" v) (sNot (sAny (map car pair-data-branches))))))
+           (constr-tag (v-ctag v))
+           (constr-branches
+            (map (lambda (ia)
+                   (cons (sAll (list (v-is-con "VConstr" v) (sEq constr-tag (s-int (car ia)))))
+                         (bind-out (eval-sym n rho (cdr ia))
+                           (lambda (v-alt) (apply-val-list-sym n v-alt (v-cargs v))))))
+                 enum))
+           (constr-error
+            (sAnd (v-is-con "VConstr" v) (sNot (tag-covered constr-tag))))
+           (unsupported-error
+            (sAny (map (lambda (c) (v-is-con c v))
+                       '("VBytes" "VString" "VData" "VPairDataList" "VArray"
+                         "VG1" "VG2" "VMlResult"))))
+           (branches (append bool-branches unit-branches int-branches list-branches
+                             data-list-branches pair-branches pair-data-branches
+                             constr-branches)))
+      (branch-outcomes branches
+        (list bool-error unit-error int-error list-error data-list-error
+              pair-error pair-data-error constr-error unsupported-error))))
+
+  (define (dyn-list-branches n rho v ctor xs is-nil field tail alts)
+    (if (> (length alts) 2) '()
+        (let* ((nil-alt (list-ref? alts 1))
+               (cons-alt (list-ref? alts 0))
+               (nil-branch
+                (if nil-alt
+                    (list (cons (sAll (list (v-is-con ctor v) (is-nil xs)))
+                                (eval-sym n rho nil-alt)))
+                    '()))
+               (cons-branch
+                (if cons-alt
+                    (list (cons (sAll (list (v-is-con ctor v) (sNot (is-nil xs))))
+                                (bind-out (eval-sym n rho cons-alt)
+                                  (lambda (v-alt)
+                                    (apply-list-sym n v-alt
+                                                    (list (field xs) (tail xs)))))))
+                    '())))
+          (append cons-branch nil-branch))))
+
+  ;;; ---- builtin semantics ------------------------------------------------
+  (define (eval-builtin-sym b args)
+    (let ((n (length args)))
       (cond
-       ((eq? s 'bool)
-        (and (fx<=? (length alts) 2)
-             (combine-ite e
-                          (let ((a (nth? alts 1))) (and a (sym-eval n env a)))
-                          (let ((a (nth? alts 0))) (and a (sym-eval n env a))))))
-       ((eq? s 'int)
-        (sym-case-int n env e 0 alts))
-       ((equal? s (smt-sort-list 'data))
-        (and (fx<=? (length alts) 2)
-             (combine-ite (smt-null e)
-                          (let ((a (nth? alts 1))) (and a (sym-eval n env a)))       ; nil  = tag 1
-                          (let ((a (nth? alts 0)))                                    ; cons = tag 0
-                            (and a
-                                 (let ((oa (sym-eval n env a)))
-                                   (and oa
-                                        (let ((oap (sym-apply-list n (sout-value oa)
-                                                     (list (sval-con (smt-head 'data e))
-                                                           (sval-con (smt-tail e))))))
-                                          (and oap (sout (sout-value oap)
-                                                         (smt-and (sout-defined oa) (sout-defined oap))))))))))))
-       ((sort-pair? s)
-        (and (fx<=? (length alts) 1)
-             (let ((a (nth? alts 0)))
-               (and a
-                    (let ((oa (sym-eval n env a)))
-                      (and oa
-                           (let ((oap (sym-apply-list n (sout-value oa)
-                                        (list (sval-con (smt-fst e)) (sval-con (smt-snd e))))))
-                             (and oap (sout (sout-value oap)
-                                            (smt-and (sout-defined oa) (sout-defined oap)))))))))))
+       ;; integer builtins
+       ((and (string=? b "addInteger") (= n 2))
+        (let ((y (car args)) (x (cadr args)))
+          (checked-const (proj-map2 op-add (as-int x) (as-int y)) sc-integer)))
+       ((and (string=? b "subtractInteger") (= n 2))
+        (let ((y (car args)) (x (cadr args)))
+          (checked-const (proj-map2 op-sub (as-int x) (as-int y)) sc-integer)))
+       ((and (string=? b "multiplyInteger") (= n 2))
+        (let ((y (car args)) (x (cadr args)))
+          (checked-const (proj-map2 op-mul (as-int x) (as-int y)) sc-integer)))
+       ((and (member b '("divideInteger" "quotientInteger" "remainderInteger" "modInteger")) (= n 2))
+        (let* ((y (car args)) (x (cadr args))
+               (p (proj-map2 cons (as-int x) (as-int y)))
+               (fn (cond ((string=? b "divideInteger") "uplc_div")
+                         ((string=? b "quotientInteger") "uplc_tdiv")
+                         ((string=? b "remainderInteger") "uplc_tmod")
+                         (else "uplc_mod"))))
+          (checked2 p (lambda (ab)
+                        (let ((a (car ab)) (bb (cdr ab)))
+                          (list (out-ok (division-guard bb)
+                                        (sv-const (sc-integer (s-app fn (list a bb)))))
+                                (out-error (sNot (division-guard bb)))))))))
+       ((and (string=? b "equalsInteger") (= n 2))
+        (let ((y (car args)) (x (cadr args))) (checked-bool (proj-map2 sEq (as-int x) (as-int y)))))
+       ((and (string=? b "lessThanInteger") (= n 2))
+        (let ((y (car args)) (x (cadr args))) (checked-bool (proj-map2 op-lt (as-int x) (as-int y)))))
+       ((and (string=? b "lessThanEqualsInteger") (= n 2))
+        (let ((y (car args)) (x (cadr args))) (checked-bool (proj-map2 op-le (as-int x) (as-int y)))))
+
+       ;; bytestrings
+       ((and (string=? b "appendByteString") (= n 2))
+        (let ((y (car args)) (x (cadr args))) (checked-const (proj-map2 seq-append (as-bytes x) (as-bytes y)) sc-bytes)))
+       ((and (string=? b "consByteString") (= n 2))
+        (let* ((bs (car args)) (byte (cadr args))
+               (p (proj-map2 cons (as-int byte) (as-bytes bs))))
+          (checked2 p (lambda (nb)
+                        (let* ((byte (car nb)) (bs (cdr nb))
+                               (in-byte (sAnd (op-ge byte (s-int 0)) (op-le byte (s-int 255)))))
+                          (list (out-ok in-byte (sv-const (sc-bytes (seq-append (seq-unit byte) bs))))
+                                (out-error (sNot in-byte))))))))
+       ((and (string=? b "sliceByteString") (= n 3))
+        (let* ((bs (car args)) (len (cadr args)) (start (caddr args))
+               (p (proj-map3 (lambda (start len bs) (list start len bs))
+                             (as-int start) (as-int len) (as-bytes bs))))
+          (checked-const
+           (proj-map (lambda (xs)
+                       (let ((start (car xs)) (len (cadr xs)) (bs (caddr xs)))
+                         (seq-extract bs
+                                      (sIte (op-lt start (s-int 0)) (s-int 0) start)
+                                      (sIte (op-lt len (s-int 0)) (s-int 0) len))))
+                     p)
+           sc-bytes)))
+       ((and (string=? b "lengthOfByteString") (= n 1))
+        (checked-const (proj-map seq-len (as-bytes (car args))) sc-integer))
+       ((and (string=? b "indexByteString") (= n 2))
+        (let* ((idx (car args)) (bs (cadr args))
+               (p (proj-map2 cons (as-bytes bs) (as-int idx))))
+          (checked2 p (lambda (bi)
+                        (let* ((bs (car bi)) (idx (cdr bi))
+                               (in-range (sAnd (op-ge idx (s-int 0)) (op-lt idx (seq-len bs)))))
+                          (list (out-ok in-range (sv-const (sc-integer (seq-nth bs idx))))
+                                (out-error (sNot in-range))))))))
+       ((and (string=? b "equalsByteString") (= n 2))
+        (let ((y (car args)) (x (cadr args))) (checked-bool (proj-map2 sEq (as-bytes x) (as-bytes y)))))
+       ((and (string=? b "lessThanByteString") (= n 2))
+        (let ((y (car args)) (x (cadr args)))
+          (checked-bool (proj-map2 (lambda (a b) (s-app "bytes_lt" (list a b))) (as-bytes x) (as-bytes y)))))
+       ((and (string=? b "lessThanEqualsByteString") (= n 2))
+        (let ((y (car args)) (x (cadr args)))
+          (checked-bool (proj-map2 (lambda (a b) (s-app "bytes_le" (list a b))) (as-bytes x) (as-bytes y)))))
+       ((and (member b '("sha2_256" "sha3_256" "blake2b_256" "keccak_256" "blake2b_224" "ripemd_160")) (= n 1))
+        (let ((uf (cond ((string=? b "sha2_256") "uplc_sha2_256")
+                        ((string=? b "sha3_256") "uplc_sha3_256")
+                        ((string=? b "blake2b_256") "uplc_blake2b_256")
+                        ((string=? b "keccak_256") "uplc_keccak_256")
+                        ((string=? b "blake2b_224") "uplc_blake2b_224")
+                        (else "uplc_ripemd_160"))))
+          (checked-const (proj-map (lambda (bs) (s-app uf (list bs))) (as-bytes (car args))) sc-bytes)))
+       ((and (string=? b "verifyEd25519Signature") (= n 3))
+        (signature3 "uplc_verifyEd25519Signature" args))
+
+       ;; strings and pass-through control builtins
+       ((and (string=? b "appendString") (= n 2))
+        (let ((y (car args)) (x (cadr args))) (checked-const (proj-map2 str-append (as-string x) (as-string y)) sc-string)))
+       ((and (string=? b "equalsString") (= n 2))
+        (let ((y (car args)) (x (cadr args))) (checked-bool (proj-map2 sEq (as-string x) (as-string y)))))
+       ((and (string=? b "encodeUtf8") (= n 1))
+        (checked-const (proj-map (lambda (s) (s-app "uplc_encodeUtf8" (list s))) (as-string (car args))) sc-bytes))
+       ((and (string=? b "decodeUtf8") (= n 1))
+        (checked2 (as-bytes (car args))
+          (lambda (bs)
+            (let ((valid (s-app "valid_utf8" (list bs))))
+              (list (out-ok valid (sv-const (sc-string (s-app "uplc_decodeUtf8" (list bs)))))
+                    (out-error (sNot valid)))))))
+       ((and (string=? b "ifThenElse") (= n 3))
+        (let* ((else-v (car args)) (then-v (cadr args)) (cond-v (caddr args))
+               (c (as-bool cond-v)))
+          (list (out-ok (sAnd (proj-guard c) (proj-val c)) then-v)
+                (out-ok (sAnd (proj-guard c) (sNot (proj-val c))) else-v)
+                (out-error (sNot (proj-guard c))))))
+       ((and (string=? b "chooseUnit") (= n 2))
+        (let ((result (car args)) (unit-v (cadr args)))
+          (case (symv-tag unit-v)
+            ((const) (if (eq? (vector-ref (vector-ref unit-v 1) 0) 'unit) (ok result) err))
+            ((dyn) (let ((g (v-is-con "VUnit" (vector-ref unit-v 1))))
+                     (list (out-ok g result) (out-error (sNot g)))))
+            (else err))))
+       ((and (string=? b "trace") (= n 2))
+        (let ((result (car args)) (msg (cadr args)))
+          (checked2 (as-string msg) (lambda (_) (ok result)))))
+       ((and (string=? b "fstPair") (= n 1)) (fst-snd-pair #t (car args)))
+       ((and (string=? b "sndPair") (= n 1)) (fst-snd-pair #f (car args)))
+
+       ;; lists and Data
+       ((and (string=? b "chooseList") (= n 3)) (builtin-choose-list args))
+       ((and (string=? b "mkCons") (= n 2)) (builtin-mk-cons args))
+       ((and (string=? b "headList") (= n 1)) (builtin-head-list (car args)))
+       ((and (string=? b "tailList") (= n 1)) (builtin-tail-list (car args)))
+       ((and (string=? b "nullList") (= n 1)) (builtin-null-list (car args)))
+       ((and (string=? b "chooseData") (= n 6)) (builtin-choose-data args))
+       ((and (string=? b "constrData") (= n 2))
+        (let ((fields (car args)) (tag (cadr args)))
+          (checked-const (proj-map2 d-constr (as-int tag) (as-data-list fields)) sc-data)))
+       ((and (string=? b "mapData") (= n 1))
+        (checked-const (proj-map d-map (as-pair-data-list (car args))) sc-data))
+       ((and (string=? b "listData") (= n 1))
+        (checked-const (proj-map d-list (as-data-list (car args))) sc-data))
+       ((and (string=? b "iData") (= n 1))
+        (checked-const (proj-map d-i (as-int (car args))) sc-data))
+       ((and (string=? b "bData") (= n 1))
+        (checked-const (proj-map d-b (as-bytes (car args))) sc-data))
+       ((and (string=? b "unConstrData") (= n 1)) (builtin-un-data "DConstr" (car args)))
+       ((and (string=? b "unMapData") (= n 1)) (builtin-un-data "DMap" (car args)))
+       ((and (string=? b "unListData") (= n 1)) (builtin-un-data "DList" (car args)))
+       ((and (string=? b "unIData") (= n 1)) (builtin-un-data "DI" (car args)))
+       ((and (string=? b "unBData") (= n 1)) (builtin-un-data "DB" (car args)))
+       ((and (string=? b "equalsData") (= n 2))
+        (let ((y (car args)) (x (cadr args))) (checked-bool (proj-map2 sEq (as-data x) (as-data y)))))
+       ((and (string=? b "mkPairData") (= n 2))
+        (let ((y (car args)) (x (cadr args)))
+          (checked1 (proj-map2 cons (as-data x) (as-data y))
+                    (lambda (ab) (sv-const (sc-pair-data (car ab) (cdr ab)))))))
+       ((and (string=? b "mkNilData") (= n 1))
+        (let ((g (unit-guard (car args))))
+          (list (out-ok g (sv-const (sc-data-list dl-nil))) (out-error (sNot g)))))
+       ((and (string=? b "mkNilPairData") (= n 1))
+        (let ((g (unit-guard (car args))))
+          (list (out-ok g (sv-const (sc-pair-data-list dm-nil))) (out-error (sNot g)))))
+
+       ;; more opaque builtins with precise guards
+       ((and (string=? b "serialiseData") (= n 1))
+        (checked-const (proj-map (lambda (d) (s-app "uplc_serializeData" (list d))) (as-data (car args))) sc-bytes))
+       ((and (string=? b "verifyEcdsaSecp256k1Signature") (= n 3))
+        (signature3 "uplc_verifyEcdsaSecp256k1Signature" args))
+       ((and (string=? b "verifySchnorrSecp256k1Signature") (= n 3))
+        (signature3 "uplc_verifySchnorrSecp256k1Signature" args))
+       ((and (string=? b "integerToByteString") (= n 3)) (builtin-integer-to-bytes args))
+       ((and (string=? b "byteStringToInteger") (= n 2))
+        (let ((bs (car args)) (endian (cadr args)))
+          (checked-const (proj-map2 (lambda (endian bs) (s-app "uplc_byteStringToInteger" (list endian bs)))
+                                    (as-bool endian) (as-bytes bs))
+                         sc-integer)))
+       ((and (member b '("andByteString" "orByteString" "xorByteString")) (= n 3))
+        (let ((y (car args)) (x (cadr args)) (pad (caddr args))
+              (uf (cond ((string=? b "andByteString") "uplc_andByteString")
+                        ((string=? b "orByteString") "uplc_orByteString")
+                        (else "uplc_xorByteString"))))
+          (checked-const (proj-map3 (lambda (pad x y) (s-app uf (list pad x y)))
+                                    (as-bool pad) (as-bytes x) (as-bytes y))
+                         sc-bytes)))
+       ((and (string=? b "complementByteString") (= n 1))
+        (checked-const (proj-map (lambda (bs) (s-app "uplc_complementByteString" (list bs))) (as-bytes (car args))) sc-bytes))
+       ((and (string=? b "readBit") (= n 2)) (builtin-read-bit args))
+       ((and (string=? b "writeBits") (= n 3)) (builtin-write-bits args))
+       ((and (string=? b "replicateByte") (= n 2)) (builtin-replicate-byte args))
+       ((and (string=? b "shiftByteString") (= n 2))
+        (let ((k (car args)) (bs (cadr args)))
+          (checked-const (proj-map2 (lambda (bs k) (s-app "uplc_shiftByteString" (list bs k)))
+                                    (as-bytes bs) (as-int k))
+                         sc-bytes)))
+       ((and (string=? b "rotateByteString") (= n 2))
+        (let ((k (car args)) (bs (cadr args)))
+          (checked-const (proj-map2 (lambda (bs k) (s-app "uplc_rotateByteString" (list bs k)))
+                                    (as-bytes bs) (as-int k))
+                         sc-bytes)))
+       ((and (string=? b "countSetBits") (= n 1))
+        (checked-const (proj-map (lambda (bs) (s-app "uplc_countSetBits" (list bs))) (as-bytes (car args))) sc-integer))
+       ((and (string=? b "findFirstSetBit") (= n 1))
+        (checked-const (proj-map (lambda (bs) (s-app "uplc_findFirstSetBit" (list bs))) (as-bytes (car args))) sc-integer))
+       ((and (string=? b "expModInteger") (= n 3)) (builtin-exp-mod args))
+
+       ;; arrays, Value, BLS
+       ((and (string=? b "dropList") (= n 2)) (builtin-drop-list args))
+       ((and (string=? b "indexArray") (= n 2)) (builtin-index-array args))
+       ((and (string=? b "lengthOfArray") (= n 1))
+        (checked-const (proj-map (lambda (xs) (s-app "vlist_length" (list xs))) (as-array (car args))) sc-integer))
+       ((and (string=? b "listToArray") (= n 1))
+        (checked-const (as-const-list (car args)) sc-array))
+       ((and (string=? b "insertCoin") (= n 4)) (builtin-insert-coin args))
+       ((and (string=? b "lookupCoin") (= n 3)) (builtin-lookup-coin args))
+       ((and (string=? b "scaleValue") (= n 2)) (builtin-scale-value args))
+       ((and (string=? b "unionValue") (= n 2)) (builtin-union-value args))
+       ((and (string=? b "valueContains") (= n 2)) (builtin-value-contains args))
+       ((and (string=? b "valueData") (= n 1))
+        (let ((e (encode-val? (car args)))) (if e (ok (sv-const (sc-data (s-app "uplc_valueData" (list e))))) err)))
+       ((and (string=? b "unValueData") (= n 1))
+        (checked1 (proj-map (lambda (d) (s-app "uplc_unValueData" (list d))) (as-data (car args))) sv-dyn))
+       ((bls-builtin b args) => (lambda (r) r))
+       (else err))))
+
+  (define (signature3 uf args)
+    (let ((msg (car args)) (sig (cadr args)) (key (caddr args)))
+      (checked-bool
+       (proj-map3 (lambda (key msg sig) (s-app uf (list key msg sig)))
+                  (as-bytes key) (as-bytes msg) (as-bytes sig)))))
+
+  (define (fst-snd-pair fst? p)
+    (let ((pp (as-pair p)) (pd (as-pair-data p)))
+      (list (out-ok (proj-guard pp) (if fst? (car (proj-val pp)) (cdr (proj-val pp))))
+            (out-ok (proj-guard pd) (sv-const (sc-data (if fst? (car (proj-val pd)) (cdr (proj-val pd))))))
+            (out-error (sNot (sOr (proj-guard pp) (proj-guard pd)))))))
+
+  (define (builtin-choose-list args)
+    (let* ((cons-case (car args)) (nil-case (cadr args)) (xs (caddr args))
+           (dl (as-data-list xs)) (vl (as-const-list xs)))
+      (append
+       (list (out-ok (sAnd (proj-guard dl) (dl-is-nil (proj-val dl))) nil-case)
+             (out-ok (sAnd (proj-guard dl) (sNot (dl-is-nil (proj-val dl)))) cons-case)
+             (out-ok (sAnd (proj-guard vl) (vl-is-nil (proj-val vl))) nil-case)
+             (out-ok (sAnd (proj-guard vl) (sNot (vl-is-nil (proj-val vl)))) cons-case))
+       (list (out-error (sNot (sOr (proj-guard dl) (proj-guard vl))))))))
+
+  (define (builtin-mk-cons args)
+    (let* ((tail (car args)) (head (cadr args))
+           (dl (as-data-list tail)) (hd (as-data head))
+           (vl (as-const-list tail)) (hv (as-const-val head))
+           (data-ok (sAnd (proj-guard dl) (proj-guard hd)))
+           (const-ok (sAnd (proj-guard vl) (proj-guard hv))))
+      (list (out-ok data-ok (sv-const (sc-data-list (dl-cons (proj-val hd) (proj-val dl)))))
+            (out-ok const-ok (sv-const (sc-const-list (vl-cons (proj-val hv) (proj-val vl)))))
+            (out-error (sNot (sOr data-ok const-ok))))))
+
+  (define (builtin-head-list xs)
+    (let* ((dl (as-data-list xs)) (vl (as-const-list xs))
+           (d-ok (sAnd (proj-guard dl) (sNot (dl-is-nil (proj-val dl)))))
+           (v-ok (sAnd (proj-guard vl) (sNot (vl-is-nil (proj-val vl))))))
+      (list (out-ok d-ok (sv-const (sc-data (dl-hd (proj-val dl)))))
+            (out-ok v-ok (sv-dyn (vl-hd (proj-val vl))))
+            (out-error (sNot (sOr d-ok v-ok))))))
+  (define (builtin-tail-list xs)
+    (let* ((dl (as-data-list xs)) (vl (as-const-list xs))
+           (d-ok (sAnd (proj-guard dl) (sNot (dl-is-nil (proj-val dl)))))
+           (v-ok (sAnd (proj-guard vl) (sNot (vl-is-nil (proj-val vl))))))
+      (list (out-ok d-ok (sv-const (sc-data-list (dl-tl (proj-val dl)))))
+            (out-ok v-ok (sv-const (sc-const-list (vl-tl (proj-val vl)))))
+            (out-error (sNot (sOr d-ok v-ok))))))
+  (define (builtin-null-list xs)
+    (let ((dl (as-data-list xs)) (vl (as-const-list xs)))
+      (list (out-ok (proj-guard dl) (sv-const (sc-bool (dl-is-nil (proj-val dl)))))
+            (out-ok (proj-guard vl) (sv-const (sc-bool (vl-is-nil (proj-val vl)))))
+            (out-error (sNot (sOr (proj-guard dl) (proj-guard vl)))))))
+
+  (define (builtin-choose-data args)
+    (let* ((b-case (list-ref args 0)) (i-case (list-ref args 1))
+           (list-case (list-ref args 2)) (map-case (list-ref args 3))
+           (constr-case (list-ref args 4)) (d-val (list-ref args 5))
+           (d (as-data d-val)) (dv (proj-val d)) (g (proj-guard d)))
+      (list (out-ok (sAnd g (v-is-con "DConstr" dv)) constr-case)
+            (out-ok (sAnd g (v-is-con "DMap" dv)) map-case)
+            (out-ok (sAnd g (v-is-con "DList" dv)) list-case)
+            (out-ok (sAnd g (v-is-con "DI" dv)) i-case)
+            (out-ok (sAnd g (v-is-con "DB" dv)) b-case)
+            (out-error (sNot g)))))
+
+  (define (builtin-un-data ctor d-val)
+    (let ((d (as-data d-val)))
+      (checked2 d
+        (lambda (dv)
+          (let ((is (v-is-con ctor dv)))
+            (cond
+             ((string=? ctor "DConstr")
+              (list (out-ok is (sv-const (sc-pair-data (d-i (d-tag dv)) (d-list (d-args dv)))))
+                    (out-error (sNot is))))
+             ((string=? ctor "DMap")
+              (list (out-ok is (sv-const (sc-pair-data-list (d-entries dv)))) (out-error (sNot is))))
+             ((string=? ctor "DList")
+              (list (out-ok is (sv-const (sc-data-list (d-elems dv)))) (out-error (sNot is))))
+             ((string=? ctor "DI")
+              (list (out-ok is (sv-const (sc-integer (d-ival dv)))) (out-error (sNot is))))
+             (else
+              (list (out-ok is (sv-const (sc-bytes (d-bval dv)))) (out-error (sNot is))))))))))
+
+  (define (builtin-integer-to-bytes args)
+    (let* ((n (car args)) (width (cadr args)) (endian (caddr args))
+           (p (proj-map3 (lambda (endian width n) (list endian width n))
+                         (as-bool endian) (as-int width) (as-int n))))
+      (checked2 p
+        (lambda (x)
+          (let* ((endian (car x)) (width (cadr x)) (n (caddr x))
+                 (basic (sAll (list (op-ge n (s-int 0)) (op-ge width (s-int 0)) (op-le width (s-int 8192)))))
+                 (defined (sAnd basic (s-app "uplc_integerToByteString_defined" (list endian width n)))))
+            (list (out-ok defined (sv-const (sc-bytes (s-app "uplc_integerToByteString" (list endian width n)))))
+                  (out-error (sNot defined))))))))
+
+  (define (builtin-read-bit args)
+    (let* ((idx (car args)) (bs (cadr args)) (p (proj-map2 cons (as-bytes bs) (as-int idx))))
+      (checked2 p
+        (lambda (bi)
+          (let* ((bs (car bi)) (idx (cdr bi))
+                 (in-range (sAnd (op-ge idx (s-int 0)) (op-lt idx (op-mul (seq-len bs) (s-int 8))))))
+            (list (out-ok in-range (sv-const (sc-bool (s-app "uplc_readBit" (list bs idx)))))
+                  (out-error (sNot in-range))))))))
+
+  (define (builtin-write-bits args)
+    (let* ((val (car args)) (idxs (cadr args)) (bs (caddr args))
+           (p (proj-map3 (lambda (bs idxs val) (list bs idxs val))
+                         (as-bytes bs) (as-const-list idxs) (as-bool val))))
+      (checked2 p
+        (lambda (x)
+          (let* ((bs (car x)) (idxs (cadr x)) (val (caddr x))
+                 (defined (s-app "uplc_writeBits_defined" (list bs idxs val))))
+            (list (out-ok defined (sv-const (sc-bytes (s-app "uplc_writeBits" (list bs idxs val)))))
+                  (out-error (sNot defined))))))))
+
+  (define (builtin-replicate-byte args)
+    (let* ((byte (car args)) (count (cadr args))
+           (p (proj-map2 cons (as-int count) (as-int byte))))
+      (checked2 p
+        (lambda (cb)
+          (let* ((count (car cb)) (byte (cdr cb))
+                 (g (sAll (list (op-ge count (s-int 0)) (op-le count (s-int 8192))
+                                (op-ge byte (s-int 0)) (op-le byte (s-int 255))))))
+            (list (out-ok g (sv-const (sc-bytes (s-app "uplc_replicateByte" (list count byte)))))
+                  (out-error (sNot g))))))))
+
+  (define (builtin-exp-mod args)
+    (let* ((m (car args)) (e (cadr args)) (base (caddr args))
+           (p (proj-map3 (lambda (base e m) (list base e m))
+                         (as-int base) (as-int e) (as-int m))))
+      (checked2 p
+        (lambda (x)
+          (let* ((base (car x)) (e (cadr x)) (m (caddr x))
+                 (defined (sAnd (op-gt m (s-int 0)) (s-app "uplc_expModInteger_defined" (list base e m)))))
+            (list (out-ok defined (sv-const (sc-integer (s-app "uplc_expModInteger" (list base e m)))))
+                  (out-error (sNot defined))))))))
+
+  (define (builtin-drop-list args)
+    (let* ((xs (car args)) (n (cadr args))
+           (vl (proj-map2 (lambda (n xs) (s-app "vlist_drop" (list n xs))) (as-int n) (as-const-list xs)))
+           (dl (proj-map2 (lambda (n xs) (s-app "dlist_drop" (list n xs))) (as-int n) (as-data-list xs))))
+      (list (out-ok (proj-guard vl) (sv-const (sc-const-list (proj-val vl))))
+            (out-ok (proj-guard dl) (sv-const (sc-data-list (proj-val dl))))
+            (out-error (sNot (sOr (proj-guard vl) (proj-guard dl)))))))
+  (define (builtin-index-array args)
+    (let* ((idx (car args)) (arr (cadr args))
+           (p (proj-map2 cons (as-array arr) (as-int idx))))
+      (checked2 p
+        (lambda (ai)
+          (let* ((arr (car ai)) (idx (cdr ai))
+                 (g (sAnd (op-ge idx (s-int 0)) (op-lt idx (s-app "vlist_length" (list arr))))))
+            (list (out-ok g (sv-dyn (s-app "vlist_index" (list idx arr))))
+                  (out-error (sNot g))))))))
+
+  (define (builtin-insert-coin args)
+    (let* ((value (car args)) (amount (cadr args)) (token (caddr args)) (policy (list-ref args 3)))
+      (checked1 (proj-map3 (lambda (policy token amount) (list policy token amount))
+                           (as-bytes policy) (as-bytes token) (as-int amount))
+                (lambda (x)
+                  (let ((v (encode-val? value)))
+                    (if v
+                        (sv-dyn (s-app "uplc_insertCoin" (list (car x) (cadr x) (caddr x) v)))
+                        (sv-dyn v-unit)))))))
+  (define (builtin-lookup-coin args)
+    (let* ((value (car args)) (token (cadr args)) (policy (caddr args)))
+      (checked-const (proj-map2 (lambda (policy token)
+                                  (let ((v (encode-val? value)))
+                                    (if v (s-app "uplc_lookupCoin" (list policy token v)) (s-int 0))))
+                                (as-bytes policy) (as-bytes token))
+                     sc-integer)))
+  (define (builtin-scale-value args)
+    (let ((value (car args)) (scale (cadr args)))
+      (checked1 (as-int scale)
+                (lambda (scale)
+                  (let ((v (encode-val? value)))
+                    (if v (sv-dyn (s-app "uplc_scaleValue" (list scale v))) (sv-dyn v-unit)))))))
+  (define (builtin-union-value args)
+    (let ((b (car args)) (a (cadr args)))
+      (let ((ae (encode-val? a)) (be (encode-val? b)))
+        (if (and ae be) (ok (sv-dyn (s-app "uplc_unionValue" (list ae be)))) err))))
+  (define (builtin-value-contains args)
+    (let ((b (car args)) (a (cadr args)))
+      (let ((ae (encode-val? a)) (be (encode-val? b)))
+        (if (and ae be) (ok (sv-const (sc-bool (s-app "uplc_valueContains" (list ae be))))) err))))
+
+  (define (bls-builtin b args)
+    (let ((n (length args)))
+      (cond
+       ((and (string=? b "bls12_381_G1_add") (= n 2))
+        (let ((y (car args)) (x (cadr args))) (checked-const (proj-map2 (lambda (x y) (s-app "uplc_g1_add" (list x y))) (as-g1 x) (as-g1 y)) sc-g1)))
+       ((and (string=? b "bls12_381_G1_neg") (= n 1))
+        (checked-const (proj-map (lambda (g) (s-app "uplc_g1_neg" (list g))) (as-g1 (car args))) sc-g1))
+       ((and (string=? b "bls12_381_G1_scalarMul") (= n 2))
+        (let ((g (car args)) (k (cadr args))) (checked-const (proj-map2 (lambda (k g) (s-app "uplc_g1_scalarMul" (list k g))) (as-int k) (as-g1 g)) sc-g1)))
+       ((and (string=? b "bls12_381_G1_equal") (= n 2))
+        (let ((y (car args)) (x (cadr args))) (checked-bool (proj-map2 (lambda (x y) (s-app "uplc_g1_equal" (list x y))) (as-g1 x) (as-g1 y)))))
+       ((and (string=? b "bls12_381_G1_hashToGroup") (= n 2))
+        (let ((dst (car args)) (bs (cadr args))) (checked-const (proj-map2 (lambda (bs dst) (s-app "uplc_g1_hashToGroup" (list bs dst))) (as-bytes bs) (as-bytes dst)) sc-g1)))
+       ((and (string=? b "bls12_381_G1_compress") (= n 1))
+        (checked-const (proj-map (lambda (g) (s-app "uplc_g1_compress" (list g))) (as-g1 (car args))) sc-bytes))
+       ((and (string=? b "bls12_381_G1_uncompress") (= n 1))
+        (checked-const (proj-map (lambda (bs) (s-app "uplc_g1_uncompress" (list bs))) (as-bytes (car args))) sc-g1))
+       ((and (string=? b "bls12_381_G2_add") (= n 2))
+        (let ((y (car args)) (x (cadr args))) (checked-const (proj-map2 (lambda (x y) (s-app "uplc_g2_add" (list x y))) (as-g2 x) (as-g2 y)) sc-g2)))
+       ((and (string=? b "bls12_381_G2_neg") (= n 1))
+        (checked-const (proj-map (lambda (g) (s-app "uplc_g2_neg" (list g))) (as-g2 (car args))) sc-g2))
+       ((and (string=? b "bls12_381_G2_scalarMul") (= n 2))
+        (let ((g (car args)) (k (cadr args))) (checked-const (proj-map2 (lambda (k g) (s-app "uplc_g2_scalarMul" (list k g))) (as-int k) (as-g2 g)) sc-g2)))
+       ((and (string=? b "bls12_381_G2_equal") (= n 2))
+        (let ((y (car args)) (x (cadr args))) (checked-bool (proj-map2 (lambda (x y) (s-app "uplc_g2_equal" (list x y))) (as-g2 x) (as-g2 y)))))
+       ((and (string=? b "bls12_381_G2_hashToGroup") (= n 2))
+        (let ((dst (car args)) (bs (cadr args))) (checked-const (proj-map2 (lambda (bs dst) (s-app "uplc_g2_hashToGroup" (list bs dst))) (as-bytes bs) (as-bytes dst)) sc-g2)))
+       ((and (string=? b "bls12_381_G2_compress") (= n 1))
+        (checked-const (proj-map (lambda (g) (s-app "uplc_g2_compress" (list g))) (as-g2 (car args))) sc-bytes))
+       ((and (string=? b "bls12_381_G2_uncompress") (= n 1))
+        (checked-const (proj-map (lambda (bs) (s-app "uplc_g2_uncompress" (list bs))) (as-bytes (car args))) sc-g2))
+       ((and (string=? b "bls12_381_millerLoop") (= n 2))
+        (let ((g2 (car args)) (g1 (cadr args))) (checked-const (proj-map2 (lambda (g1 g2) (s-app "uplc_millerLoop" (list g1 g2))) (as-g1 g1) (as-g2 g2)) sc-ml)))
+       ((and (string=? b "bls12_381_mulMlResult") (= n 2))
+        (let ((y (car args)) (x (cadr args))) (checked-const (proj-map2 (lambda (x y) (s-app "uplc_mulMlResult" (list x y))) (as-ml x) (as-ml y)) sc-ml)))
+       ((and (string=? b "bls12_381_finalVerify") (= n 2))
+        (let ((y (car args)) (x (cadr args))) (checked-bool (proj-map2 (lambda (x y) (s-app "uplc_finalVerify" (list x y))) (as-ml x) (as-ml y)))))
+       ((and (string=? b "bls12_381_G1_multiScalarMul") (= n 2))
+        (let ((points (car args)) (scalars (cadr args))) (checked-const (proj-map2 (lambda (scalars points) (s-app "uplc_g1_multiScalarMul" (list scalars points))) (as-const-list scalars) (as-const-list points)) sc-g1)))
+       ((and (string=? b "bls12_381_G2_multiScalarMul") (= n 2))
+        (let ((points (car args)) (scalars (cadr args))) (checked-const (proj-map2 (lambda (scalars points) (s-app "uplc_g2_multiScalarMul" (list scalars points))) (as-const-list scalars) (as-const-list points)) sc-g2)))
        (else #f))))
 
-  ;; Nested `ite` for a symbolic-integer `Case`: ite (e==i) altᵢ (… (e==i+1) …),
-  ;; bottoming out at the empty alt-list as undefined.  Mirrors symCaseInt.
-  (define (sym-case-int n env e i alts)
-    (if (null? alts) #f
-        (combine-ite (smt-bin 'eq e (smt-int i))
-                     (sym-eval n env (car alts))
-                     (sym-case-int n env e (fx+ i 1) (cdr alts)))))
+  ;;; ---- inputs and scripts ----------------------------------------------
+  (define (make-syminput value consts sides) (vector value consts sides))
+  (define (syminput-value i)  (vector-ref i 0))
+  (define (syminput-consts i) (vector-ref i 1))
+  (define (syminput-sides i)  (vector-ref i 2))
 
-  ;;; ======================================================================
-  ;;; Top-level interface.
-  ;;; ======================================================================
+  (define (mk-input name kind)
+    (let ((n (sanitize name)))
+      (case kind
+        ((integer) (make-syminput (sv-const (sc-integer (s-atom n))) (list (cons n 'int)) '()))
+        ((bool) (make-syminput (sv-const (sc-bool (s-atom n))) (list (cons n 'bool)) '()))
+        ((bytes bytestring) (make-syminput (sv-const (sc-bytes (s-atom n))) (list (cons n 'bytes)) (list (s-app "bytes_valid" (list (s-atom n))))))
+        ((string str) (make-syminput (sv-const (sc-string (s-atom n))) (list (cons n 'string)) '()))
+        ((data) (make-syminput (sv-const (sc-data (s-atom n))) (list (cons n 'data)) (list (s-app "data_valid" (list (s-atom n))))))
+        ((unit) (make-syminput (sv-const sc-unit) '() '()))
+        ((dataList) (make-syminput (sv-const (sc-data-list (s-atom n))) (list (cons n 'dataList)) (list (s-app "dlist_valid" (list (s-atom n))))))
+        ((pairDataList) (make-syminput (sv-const (sc-pair-data-list (s-atom n))) (list (cons n 'dataPairList)) (list (s-app "dplist_valid" (list (s-atom n))))))
+        ((list) (make-syminput (sv-const (sc-const-list (s-atom n))) (list (cons n 'valList)) (list (s-app "const_vlist_valid" (list (s-atom n))))))
+        ((anyV val) (make-syminput (sv-dyn (s-atom n)) (list (cons n 'val)) (list (s-app "val_valid" (list (s-atom n))))))
+        (else (error 'mk-input "unknown input kind" kind)))))
+
   (define default-fuel (make-parameter 5000))
+  (define (make-compiled result consts sides) (vector result consts sides))
+  (define (compiled-result c) (vector-ref c 0))
+  (define (compiled-consts c) (vector-ref c 1))
+  (define (compiled-sides c)  (vector-ref c 2))
+  (define (uplc-symbolic-compile fuel inputs t)
+    (let* ((seeded (map (lambda (p) (mk-input (car p) (cdr p))) inputs))
+           (env (map syminput-value seeded)))
+      (make-compiled (eval-sym fuel env t)
+                     (apply append (map syminput-consts seeded))
+                     (apply append (map syminput-sides seeded)))))
 
-  ;; Compile a term in a symbolic environment; returns a SymOut or #f.
-  (define (compile-term t env . opt)
-    (sym-eval (if (null? opt) (default-fuel) (car opt)) env t))
+  ;;; ---- outcome conditions and goals ------------------------------------
+  (define (okBoolCond outs want)
+    (sAny
+     (filter-map
+      (lambda (o)
+        (and (eq? (outcome-tag o) 'ok)
+             (let ((b (as-bool (outcome-val o))))
+               (sAll (list (outcome-pc o) (proj-guard b)
+                           (if want (proj-val b) (sNot (proj-val b))))))))
+      outs)))
+  (define (okBoolTrueCond outs) (okBoolCond outs #t))
+  (define (okIntEqCond outs rhs)
+    (sAny
+     (filter-map
+      (lambda (o)
+        (and (eq? (outcome-tag o) 'ok)
+             (let ((i (as-int (outcome-val o))))
+               (sAll (list (outcome-pc o) (proj-guard i) (sEq (proj-val i) rhs))))))
+      outs)))
+  (define (okValEqCond outs target)
+    (sAny
+     (filter-map
+      (lambda (o)
+        (and (eq? (outcome-tag o) 'ok)
+             (let ((e (encode-val? (outcome-val o))))
+               (and e (sAll (list (outcome-pc o) (sEq e target)))))))
+      outs)))
+  (define (errorCond outs)
+    (sAny (filter-map (lambda (o) (and (eq? (outcome-tag o) 'error) (outcome-pc o))) outs)))
+  (define (timeoutCond outs)
+    (sAny (filter-map (lambda (o) (and (eq? (outcome-tag o) 'timeout) (outcome-pc o))) outs)))
 
-  ;; The top-level success formula `defined AND value` of a validator whose
-  ;; result is a first-order (boolean) `scon`; #f otherwise.  Mirrors `extract`.
-  (define (extract o)
-    (and o (eq? (sym-vtag (sout-value o)) 'scon)
-         (smt-and (sout-defined o) (scon-e (sout-value o)))))
+  (define (label name e) (cons name e))
+  (define (goal-equals-v outs target) (list (label "goal" (okValEqCond outs target))))
+  (define (goal-returns-bool outs b) (list (label "goal" (okBoolCond outs b))))
+  (define (goal-returns-int outs i) (list (label "goal" (okIntEqCond outs (s-int i)))))
+  (define (goal-errors outs) (list (label "is_error" (errorCond outs))))
+  (define (goal-succeeds outs) (list (label "no_error" (sNot (errorCond outs)))))
+  (define (goal-indeterminate outs) (list (label "indeterminate" (timeoutCond outs))))
 
-  (define (compile-success t env . opt)
-    (let ((o (apply compile-term t env opt))) (and o (extract o))))
-
-  ;; Negation of "precondition `pre` implies success" — assert this and an
-  ;; `unsat` from z3 proves the validator is defined and returns true for all
-  ;; inputs satisfying `pre`.  Mirrors `encodeProperty`.
-  (define (encode-property pre success) (smt-not (smt-imp pre success)))
-
-  ;; Compile to the z3-ready property formula, given a precondition `pre`.
-  (define (compile-property t env pre . opt)
-    (let ((s (apply compile-success t env opt)))
-      (and s (encode-property pre s)))))
+  (define (compiled->script c goal)
+    (make-smt-script (compiled-consts c) (compiled-sides c) (goal (compiled-result c))))
+  (define (compiled->smtlib c goal)
+    (smt-script->smtlib (compiled->script c goal))))

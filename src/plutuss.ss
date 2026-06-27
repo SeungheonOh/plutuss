@@ -16,20 +16,42 @@
           get-cpu-spent get-mem-spent get-mach-logs i64-max i64-min
           parse-err? eval-fail? parse-err-msg eval-fail-msg
           parse-error eval-failure builtin-lookup hex->bytevector
-          ;; SMT layer (deep-embedded SMT-LIB + z3 bridge)
-          smt-sort-int smt-sort-bool smt-sort-data smt-sort-bytes
-          smt-sort-list smt-sort-pair
-          smt-var smt-int smt-bool smt-neg smt-not smt-bin smt-uop smt-ite
-          smt-mkpair smt-fst smt-snd smt-nil smt-cons smt-head smt-tail smt-null
-          smt-verify-sig smt-bls-bin smt-bls-operand-sorts smt-bls-result-sort
-          smt-true smt-false smt-and smt-or smt-eq smt-imp smt-ne-zero smt-conj
-          smt-sort-of smt->smtlib run-z3 z3-check z3-model z3-raw
-          ;; UPLC -> SMT denotational compiler
-          symbolic-input make-sym-env sym-env-extend empty-sym-env
-          sym-eval extract encode-property default-fuel
-          compile-term compile-success compile-property current-concrete-builtin
-          c-integer c-bool c-bytestring c-unit c-data
-          builtin-name builtin-arity builtin-forces)
+          ;; SMT-LIB v2 target (universal value sort V + z3 bridge)
+          s-int s-bool s-str s-atom s-app s-tag
+          sNot sAnd sOr sImplies sIte sEq sNe sAll sAny sOrs s-beq s-render
+          ssort-render sanitize
+          v-int v-as-int v-bool v-as-bool v-bs v-as-bs v-str v-as-str v-unit
+          v-data v-as-data v-list v-as-list v-dlist v-as-dl v-pdlist v-as-dm
+          v-arr v-as-arr v-pair v-fst v-snd v-paird v-fst-d v-snd-d
+          v-constr v-ctag v-cargs v-g1 v-as-g1 v-g2 v-as-g2 v-ml v-as-ml
+          v-is-con v-con-name v-sis-con
+          d-constr d-map d-list d-i d-b d-tag d-args d-entries d-elems d-ival d-bval
+          vl-nil vl-cons vl-hd vl-tl vl-is-nil vl-of-list vl-sis-nil vl-shd vl-stl
+          dl-nil dl-cons dl-hd dl-tl dl-is-nil dl-of-list dl-sis-nil dl-shd dl-stl
+          dm-nil dm-cons dm-key dm-val dm-tl dm-is-nil dm-of-list
+          seq-empty seq-empty-sort seq-unit seq-len seq-nth seq-append seq-extract seq-of-bytes
+          str-append op-add op-sub op-mul op-div op-mod op-lt op-le op-gt op-ge op-neg
+          prelude datatype-preamble opaque-ufs ufdecl-render
+          make-smt-script smt-script-consts smt-script-side smt-script-asserts
+          smt-script->smtlib z3-command run-z3 z3-check z3-model
+          ;; UPLC -> SMT denotational symbolic compiler
+          sv-const sv-dyn sv-fo sv-pair sv-lam sv-delay sv-constr sv-builtin sv-choice symv-tag
+          sc-integer sc-bytes sc-string sc-bool sc-unit sc-data sc-const-list
+          sc-data-list sc-pair-data-list sc-pair-data sc-array sc-g1 sc-g2 sc-ml
+          outcome-tag outcome-pc outcome-val ok err timeout bind-out map-pc
+          encode-val? as-int as-bytes as-string as-bool as-data as-const-list
+          symr symr-inc symr-err symr-val junk
+          merge-val sym-merge reify-fo reify-v reify-err
+          const->sexpr data->sexpr const-literal sym-lookup
+          builtin-name builtin-spec expected-args
+          sym-eval eval-sym sym-apply apply-sym sym-force force-sym sym-case case-sym
+          eval-builtin-sym
+          mk-input uplc-symbolic-compile default-fuel
+          compiled-result compiled-consts compiled-sides
+          okBoolTrueCond okBoolCond okIntEqCond okValEqCond errorCond timeoutCond
+          goal-equals-v goal-returns-bool goal-returns-int
+          goal-errors goal-succeeds goal-indeterminate
+          compiled->script compiled->smtlib)
   (import (plutuss base) (plutuss value) (plutuss cbor) (plutuss cost)
           (plutuss state) (plutuss builtins) (plutuss machine)
           (plutuss frontend) (plutuss output) (plutuss flat) (plutuss dsl)

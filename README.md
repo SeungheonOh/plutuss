@@ -105,137 +105,123 @@ string parser's output, so it feeds the same `name->debruijn` + CEK pipeline.
 ## Symbolic execution: UPLC → SMT (z3-backed verification)
 
 `(plutuss compile)` is a **denotational compiler** from UPLC to SMT-LIB, and
-`(plutuss smt)` is its target — a deep-embedded SMT expression language with a
-sort checker, an SMT-LIB serializer, and a z3 bridge. Together they let you
-*prove* facts about a validator for **all** inputs, instead of evaluating it on
-one concrete input.
+`(plutuss smt)` is its target. Together they let you *prove* facts about a
+validator for **all** inputs (or *find* an input meeting a goal), instead of
+evaluating it on one concrete input.
 
-The compiler is a **symbolic CEK machine**: it runs the exact same machine as
-`(plutuss machine)`, but over a value domain where a constant is an `smt`
-expression rather than a concrete datum. A symbolic input is a free SMT
-variable, so evaluating a term yields an `smt` expression denoting the result as
-a function of the inputs — together with a **definedness** guard that holds
-exactly at inputs for which the concrete CEK evaluation would not error (e.g.
-`divideInteger` contributes `y ≠ 0`, `unIData` contributes `isI d`).
+`(plutuss smt)` is a small SMT-LIB v2 AST whose centrepiece is a **universal
+value sort `Val`** — one datatype covering every first-order UPLC value
+(`VInt`/`VBytes`/`VString`/`VBool`/`VUnit`/`VData`/`VList`/`VDataList`/
+`VPairDataList`/`VPair`/`VPairData`/`VArray`/`VConstr`/BLS elements).
+ByteStrings are `Bytes = (Seq Int)` with a `bytes_valid` well-formedness
+predicate; Plutus `Data` is the sort `Data`, and builtin lists are datatypes
+(`ValList`/`DataList`/`DataPairList`) so head/tail/null/chooseList are native
+selectors. Higher-order values (closures, thunks, partial builtins) are not in
+`Val` — the compiler keeps them structural at Scheme-eval time.
 
-It is a faithful Scheme port of the verified Lean development
+`(plutuss compile)` is a fuel-bounded **normalisation-by-evaluation** interpreter
+— a structural clone of the big-step CEK evaluator — over the symbolic value
+domain `SymVal`. Its result is a list of guarded outcomes:
+
+* `ok pc value` — the term returns `value` under path condition `pc`.
+* `error pc` — the precise UPLC error condition: type mismatch, division by
+  zero, head-of-nil, out-of-range tag, and so on.
+* `timeout pc` — the fuel bound was exhausted on that path.
+
+Because outcomes are path-conditioned, one compiled result describes the whole
+input space at once. Lazy symbolic branches are kept as separate guarded
+outcomes, and branching on symbolic data becomes SMT conditions over those
+outcomes rather than a Scheme-level fork.
+
+It is a faithful Scheme port of the Lean development
 [`utxo-company/moist`](https://github.com/utxo-company/moist)
-(`Moist/Compile/*.lean`): the five mutually-recursive functions mirror the
-machine's compute/return/force/apply transitions one-for-one, closures are
+(`Moist/SMT/Basic.lean` and `Moist/SMT/UPLC.lean`): `eval-sym`/`apply-sym`/
+`force-sym`/`case-sym` mirror the machine transitions one-for-one, closures are
 defunctionalized exactly as the CEK does (they never appear in the emitted SMT),
-and unbounded recursion is handled by `fuel` — bottoming out at a sound
-*refusal* or a `defined = false` leaf, never a silent under-approximation.
+and unbounded recursion is handled by `fuel`.
 
 ```scheme
 (import (chezscheme))
 (library-directories (list "src"))
-(import (plutuss smt) (plutuss compile) (plutuss dsl) (plutuss frontend))
+(import (plutuss smt) (plutuss compile))            ; FFI-free: no native crypto
 
-;; validator  0 <= x*x  as a closed function of its one symbolic integer input x;
-;; name->debruijn it and strip the leading lambda to expose the body (x = Var 1).
+;; Build UPLC terms directly (de Bruijn; Var 1 = the first symbolic input).
+(define (intC n)   (vector 'con (cons 'integer n)))
+(define (b2 op x y)(vector 'app (vector 'app (vector 'builtin op) x) y))
+
+;; validator  0 <= x*x  (one symbolic integer input, x = Var 1)
 (define validator
-  (uplc (lam x ((builtin lessThanEqualsInteger) (con integer 0)
-                ((builtin multiplyInteger) x x)))))
-(define body (vector-ref (name->debruijn validator) 2))   ; strip the lam
-(define env  (make-sym-env (symbolic-input "x" smt-sort-int)))
+  (b2 'lessThanEqualsInteger (intC 0) (b2 'multiplyInteger (vector 'var 1) (vector 'var 1))))
+(define c (uplc-symbolic-compile 10 (list (cons "x" 'integer)) validator))
 
-;; compile to the success formula  (defined AND value)  and ask z3
-(define ok (compile-success body env))
-(z3-check (encode-property smt-true ok))     ; => unsat  (true for ALL x)
+;; prove it for ALL x by refuting "it returns false":
+(z3-check (compiled->smtlib c (lambda (r) (goal-returns-bool r #f))))   ; => unsat
+
+;; or solve for a witness — find x with  equalsInteger 10 (addInteger 5 x) = true:
+(define c2 (uplc-symbolic-compile 10 (list (cons "x" 'integer))
+             (b2 'equalsInteger (intC 10) (b2 'addInteger (intC 5) (vector 'var 1)))))
+(z3-check (compiled->smtlib c2 (lambda (r) (goal-returns-bool r #t))))  ; => sat  (x = 5)
 ```
 
-`z3-check` returns `'unsat` (the negated property has no model ⇒ the validator
-is defined and returns `true` for every input), `'sat` (a counterexample
-exists — recover it with `z3-model`), or `'unknown`. A precondition `P` is the
-first argument of `encode-property`: `(encode-property P ok)` asks whether
-`P ⇒ success` holds for all inputs.
+`uplc-symbolic-compile fuel inputs term` returns a compiled result; a **goal**
+maps that result to SMT assertions, and `compiled->smtlib` emits the runnable
+script. The goal builders are `goal-returns-bool`/`goal-returns-int`/
+`goal-equals-v` (the value equals a target), `goal-succeeds`/`goal-errors`,
+and `goal-indeterminate` (fuel timeout). `z3-check` returns `'sat` (a witness —
+recover the model with `z3-model`/`run-z3`), `'unsat` (no such input), or
+`'unknown`. Scripts mirror Moist: unlabelled assertions, `(check-sat)`, and
+`(get-model)`.
 
-To see the SMT-LIB *text* the compiler produces — the success formula as an
-s-expression (`smt->sexpr`) and the complete script (`smt->smtlib`: logic, the
-`Data` datatype, the division preamble, `declare-const`s, `assert`, `check-sat`)
-— run `chez --script example-smt.ss`. Building terms with the `uplc` DSL imports
-`(plutuss builtins)`, so it loads the native crypto libraries; the
-`(plutuss smt)` / `(plutuss compile)` layers it drives stay FFI-free.
+**Builtin coverage.** Precise SMT for integer ops (incl. floor/trunc div & mod),
+bytestring ops including slicing, lexicographic comparison and indexing, string
+ops, `ifThenElse`/`chooseUnit`/`trace`, pairs, lists, arrays, `Data`
+constructors/destructors, value builtins, bitwise bytestring builtins,
+`integerToByteString`/`byteStringToInteger`, `expModInteger`, hashes,
+signatures, and BLS operations. Operations without native SMT definitions are
+represented with uninterpreted functions plus the same guard/error conditions as
+the current Moist model. Constant literals are first-order too
+(`Integer`/`Bool`/`ByteString`/`String`/`Unit`/`Data` and list/pair/array
+flavours), so they compose with symbolic builtins. Lambda, delay, force, apply,
+`constr`, and `case` are supported; `case` dispatches on symbolic
+`Bool`/`Integer`/list/pair/constr scrutinees by guarded outcomes.
 
-For a more involved proof, `chez --script example-find.ss` verifies a
-higher-order recursive list function — `find :: (a -> Bool) -> [a] -> Maybe a`,
-with `List` and `Maybe` declared via `define-plutus-type-SOP` (so they are
-SOP-encoded with UPLC `constr`/`case`, which the compiler supports) — proving
-e.g. `forall x. find (== x) [] == Nothing` and the correctness of searching a
-symbolic-element list with a symbolic predicate (the symbolic `ifThenElse`es
-compile to nested SMT `ite`s), and refuting a false claim with a counterexample.
+**Partiality** is carried in `err`, never as a partial meaning, so the divide
+builtins contribute `y = 0` to `err` and `(x*y)/y = x` is provable only once
+`y ≠ 0` is assumed.
 
-**Supported first-order fragment** (everything else is *refused* — returns `#f`,
-the sound failure mode, never a wrong answer): integer arithmetic and
-comparison; constant **literals** are first-order — `Integer`/`Bool`/`ByteString`
-and `Data` / `(list data)` literals compile to `sCon` SMT terms, so a literal
-composes with the symbolic builtins (`equalsByteString (sha2_256 x) (con
-bytestring #ab)`, `mkCons (iData x) (con (list data) [])`, …); `ifThenElse`
-(concrete or symbolic-boolean control flow, the latter compiled to an SMT
-`ite`); `trace`/`chooseUnit`, and `chooseData`/`chooseList`/`mkCons` on concrete
-operands (pass-through; a now first-order `data`/`(list data)` literal makes
-`chooseData`/`chooseList` refuse, while `mkCons` on `data` composes via `consL`);
-the `Data` injections/projections
-(`iData`/`bData`/`unIData`/`unBData`/`unConstrData`/`unListData`) **and symbolic
-`Data` construction** (`constrData` — symbolic on both tag *and* fields —
-`listData`, and `mkCons`/`mkNilData` over a `list data`, so `Data` is built from
-symbolic variables and round-tripped through z3's datatype axioms),
-`fstPair`/`sndPair`, `headList`/`tailList`/`nullList`, `lengthOfByteString`,
-`equalsData`/`equalsByteString`; and the cryptographic hashes (`sha2_256`,
-`sha3_256`, `blake2b_256`, `blake2b_224`, `keccak_256`, `ripemd_160`),
-`serialiseData`, the BLS12-381 G1/G2/pairing ops, and the three
-signature-verification primitives — all **axiomatized as uninterpreted SMT
-functions** (z3 reasons about them abstractly, `x = y → f x = f y`, so e.g.
-`sha2_256 a = sha2_256 b` does *not* prove `a = b`). Lambda, delay, force,
-apply, `constr`, and `case` are fully supported (defunctionalized) — and `case`
-dispatches not only on a `constr` value but on a builtin scrutinee: a builtin
-*constant* (`Bool`/`Unit`/`Integer`/list/pair) by sum-of-products, and a
-(possibly symbolic) `Bool`/`Integer`/list/pair value by `ite`-combination (so a
-`case` over `unListData d` or `unConstrData d` for a symbolic `d` splits into the
-`Cons`/`Nil` or field branches).
+**Bounded recursion.** A recursive validator (built with the Z combinator)
+unrolls up to the fuel budget. Within the unrolled depth, z3 can prove or refute
+the requested property; beyond it the result contains `timeout` outcomes, so
+`goal-indeterminate` can be used to ask whether some input is beyond the current
+horizon. More fuel gives a deeper frontier. `prove-sum.ss` also shows the usual
+induction pattern: abstract the recursive call as a symbolic input carrying the
+induction hypothesis, then prove the one-step body for all inputs.
 
-**Partiality** is carried as a separate definedness guard, never as a partial
-meaning, so `(x*y)/y = x` is `sat` with no precondition (z3 finds `y=0`) but
-`unsat` under the precondition `(smt-ne-zero (smt-var "y" smt-sort-int))`.
+A builtin is identified by its UPLC name. A `(builtin desc)` node may carry a
+real `(plutuss builtins)` descriptor (from the parser/`uplc` DSL, read via record
+reflection) or a plain name string/symbol (for FFI-free programmatic use); both
+work. Because it needs none of the native-crypto builtins, `(plutuss compile)`
+imports neither `(plutuss builtins)` nor any FFI — it runs anywhere z3 is on
+`PATH`.
 
-**Bounded recursion.** A recursive validator (built with the Z combinator) whose
-guard is symbolic defers a lazy `ifThenElse`, and forcing it unrolls *both*
-branches up to the fuel budget, emitting nested SMT `ite`s. Within the unrolled
-depth the property is proved; beyond it the `defined` flag is `false`, so the
-tool soundly makes **no claim**. More fuel ⇒ a deeper verified frontier
-(`--fuel`); `sum i = if i≤0 then 0 else i + sum (i-1)` proves `0 ≤ sum i` for
-`0≤i≤3` at fuel 40, `0≤i≤10` at fuel 90, and so on.
-
-A builtin is identified by its UPLC name. A `(builtin desc)` node may carry
-either a real `(plutuss builtins)` descriptor (from the parser/`uplc` DSL) or a
-plain name string (for FFI-free programmatic use); both work. Because the
-first-order fragment needs none of the native-crypto builtins, `(plutuss smt)`
-and `(plutuss compile)` import neither `(plutuss builtins)` nor any FFI — they
-run anywhere z3 is on `PATH`.
-
-A `current-concrete-builtin` parameter is an optional hook for constant-folding
-a fully-concrete application of a builtin outside the symbolic table; it is off
-by default (so such a builtin is soundly refused). To enable full concrete
-coverage on a machine with the native libraries, install one backed by
-`(plutuss builtins)`'s `call-builtin`.
-
-### Tools
+### Examples & tools
 
 ```sh
-# Prove a validator from a .uplc file: strip its leading lambdas to symbolic
-# inputs of the given sorts (outermost lambda first), compile, and run z3.
-chez --script tools/smt.ss --in data --in data --in data validator.uplc
-chez --script tools/smt.ss --in int --emit --model program.uplc
+chez --script example-symbolic.ss          # the worked suite (ported from moist's
+chez --script example-symbolic.ss --emit   #   Test/Symbolic/Examples.lean), 15 cases
+chez --script example-advanced-symbolic.ss # richer examples: Data, arrays, dynamic Val,
+                                           #   bytestring constraints, hash congruence
+chez --script prove-sum.ss                 # bounded model checking + an unbounded
+                                           #   proof by induction (forall x. sum x >= 0)
+chez --script example-find.ss              # higher-order recursive `find` over SOP
+                                           #   List/Maybe, proved for ALL inputs
 
-# Direct z3 runner / self-testing demo of the compiler.
-chez --script tools/z3.ss --demo                 # 12 example validators -> z3
-chez --script tools/z3.ss --smt2 query.smt2      # run z3 on a raw SMT-LIB file
+chez --script tools/z3.ss --demo           # a few example validators -> z3
+chez --script tools/z3.ss --smt2 query.smt2  # run z3 on a raw SMT-LIB file
 ```
 
-`tools/smt.ss` goes through the full UPLC parser and `tools/z3.ss` builds its
-example terms with the `uplc` DSL, so both (like every other term-building entry
-point) load the native crypto libraries; the `(plutuss smt)` / `(plutuss
-compile)` layers they drive remain FFI-free.
+All of the above build UPLC terms directly (no parser/DSL), so they stay
+FFI-free and run anywhere z3 is installed.
 
 ## Flat (binary) codec
 
@@ -303,8 +289,8 @@ flowchart TB
   output["(plutuss output)<br/>pretty printer · alpha-eq comparison"]
   flat["(plutuss flat)<br/>flat binary codec"]
   dsl["(plutuss dsl)<br/>uplc macro front-end"]
-  smt["(plutuss smt)<br/>deep-embedded SMT-LIB · sortOf · serializer · z3 bridge"]
-  compile["(plutuss compile)<br/>symbolic CEK · UPLC→SMT denotation"]
+  smt["(plutuss smt)<br/>SMT-LIB v2 AST · universal value sort V · serializer · z3 bridge"]
+  compile["(plutuss compile)<br/>symbolic NbE evaluator · guarded outcomes · UPLC→SMT"]
 
   base --> value --> cost --> state --> builtins --> machine --> dsl
   base --> cbor --> builtins
