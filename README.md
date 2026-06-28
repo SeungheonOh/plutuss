@@ -220,6 +220,77 @@ chez --script tools/z3.ss --demo           # a few example validators -> z3
 chez --script tools/z3.ss --smt2 query.smt2  # run z3 on a raw SMT-LIB file
 ```
 
+## UPLC-predicate refinement checks
+
+`(plutuss refine)` layers a small refinement checker on top of the symbolic
+compiler. Refinement predicates are themselves UPLC terms: a predicate holds
+only when symbolic UPLC evaluation succeeds with `Bool true`. Returning
+`false`, erroring, timing out, or returning a non-Boolean value is treated as a
+refinement violation.
+
+The checker is FFI-free and uses the symbolic compiler's guarded outcomes
+directly:
+
+```scheme
+(import (plutuss refine))
+
+(define-upred notZero
+  ((x integer))
+  [[[(force (builtin ifThenElse))
+     [[(builtin equalsInteger) x] (con integer 0)]]
+    (con bool #f)]
+   (con bool #t)])
+
+(define/refined safeDiv
+  ((x integer)
+   (y integer #:where (notZero y)))
+  #:returns (r integer)
+  [[(builtin divideInteger) x] y])
+
+(define result (verify/refine safeDiv))
+(display-refinement-report result)
+```
+
+For each refined function, z3 checks that the input predicates are satisfiable,
+the body cannot error or run out of fuel under those predicates, the result has
+the declared first-order type, and every return predicate holds. Because
+predicates are UPLC, constructor predicates compose with normal symbolic
+branching:
+
+```scheme
+(define-upred isJust
+  ((m anyV))
+  (case m
+    (con bool #f)
+    (lam v (con bool #t))))
+
+(define/refined fromJust
+  ((m anyV #:where (isJust m)))
+  #:returns (v anyV)
+  (case m
+    (error)
+    (lam v v)))
+```
+
+Registered refined functions also expose their UPLC lambda with
+`refined-function-term`, which gives an explicit inline composition path:
+
+```scheme
+(define/refined composed
+  ((x integer #:where (notZero x)))
+  #:returns (r integer)
+  [(unquote (refined-function-term safeDiv)) x (con integer 1)])
+```
+
+Run the self-checking refinement examples with:
+
+```sh
+chez --script example-refinement.ss
+chez --script example-refinement.ss --verbose
+chez --script example-refinement-contract.ss
+chez --script example-refinement-contract.ss --verbose
+```
+
 All of the above build UPLC terms directly (no parser/DSL), so they stay
 FFI-free and run anywhere z3 is installed.
 

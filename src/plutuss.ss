@@ -51,8 +51,25 @@
           okBoolTrueCond okBoolCond okIntEqCond okValEqCond errorCond timeoutCond
           goal-equals-v goal-returns-bool goal-returns-int
           goal-errors goal-succeeds goal-indeterminate
-          compiled->script compiled->smtlib)
+          compiled->script compiled->smtlib
+          ;; UPLC-predicate refinement checker
+          current-refinement-fuel clear-refinements!
+          define-upred define/refined define-refined verify/refine
+          register-upred! lookup-upred upred?
+          register-refined! lookup-refined refined-function?
+          refined-function-term refined-function-body
+          eval-predicate eval-predicate-call
+          predicate-true-cond predicate-false-cond predicate-error-cond
+          predicate-timeout-cond predicate-non-bool-cond predicate-violation-cond
+          check-refinement verify-refined-function
+          refinement-verification? refinement-verification-name refinement-verification-ok?
+          refinement-verification-obligations refinement-verification-compiled
+          refinement-obligation? refinement-obligation-name refinement-obligation-kind
+          refinement-obligation-expected refinement-obligation-actual
+          refinement-obligation-ok? refinement-obligation-smtlib
+          refinement-report display-refinement-report
+          term->debruijn/free normalize-refinement-spec normalize-return-spec)
   (import (plutuss base) (plutuss value) (plutuss cbor) (plutuss cost)
           (plutuss state) (plutuss builtins) (plutuss machine)
           (plutuss frontend) (plutuss output) (plutuss flat) (plutuss dsl)
-          (plutuss smt) (plutuss compile)))
+          (plutuss smt) (plutuss compile) (plutuss refine)))
